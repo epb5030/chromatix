@@ -156,7 +156,11 @@ def test_read_api(store, aia_file):
     latest = {m.name: v.version for m, v in store.methods(project)}
     assert latest == {"Default": 2, "Fast": 1}
     method, mv = store.method_version(method_v2)
-    assert (method.name, mv.version, mv.params["threshold_snr"]) == ("Default", 2, 20)
+    assert (method.name, mv.version, mv.params["integration"]["threshold_snr"]) == (
+        "Default",
+        2,
+        20,
+    )
     assert [v.id for v in store.method_versions(method.id)] == [method_v1, method_v2]
     peak = store.peaks(result)[0]
     # The synthetic baseline is 2 + 0.5 t (+ noise).

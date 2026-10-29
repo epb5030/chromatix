@@ -13,6 +13,7 @@ from chromatix_core.io import write_aia
 from chromatix_core.synthetic import GaussianPeak, gaussian_chromatogram
 from chromatix_desktop import dialogs
 from chromatix_desktop.app import MainWindow
+from chromatix_desktop.plot import TYPE_COLUMN
 
 pytestmark = pytest.mark.gui
 
@@ -79,7 +80,7 @@ def test_quick_look(window, aia_files):
     window.integrate_quick_look()
     table = window.peak_table
     assert table.rowCount() == 3
-    assert [table.item(r, 5).text() for r in range(3)] == ["BB", "BV", "VB"]
+    assert [table.item(r, TYPE_COLUMN).text() for r in range(3)] == ["BB", "BV", "VB"]
 
 
 def test_store_workflow(window, tmp_path, aia_files, reasons, errors):

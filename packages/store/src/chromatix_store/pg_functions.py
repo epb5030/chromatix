@@ -19,9 +19,11 @@ PUBLIC_FUNCTIONS = (
     "chromatix_create_project(text, text)",
     "chromatix_create_sample_set(integer, text)",
     "chromatix_register_raw_file(text, bigint, text, text)",
-    "chromatix_add_injection(integer, text, text, text, text, double precision)",
+    "chromatix_add_injection(integer, text, text, text, text, double precision, jsonb)",
     "chromatix_save_method_version(integer, text, jsonb, text)",
     "chromatix_save_result(integer, integer, text, jsonb)",
+    "chromatix_save_calibration(integer, integer, text, text, text, boolean, jsonb, "
+    "double precision, jsonb)",
 )
 INTERNAL_FUNCTIONS = (
     "chromatix_current_user()",

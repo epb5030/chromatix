@@ -50,6 +50,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from chromatix_core import Chromatogram, IntegrationParams, integrate
 from chromatix_core.io import read_aia
+from chromatix_core.quant import ProcessingMethod as QuantMethod
 from chromatix_core.synthetic import GaussianPeak, gaussian_chromatogram
 from chromatix_desktop import dialogs
 from chromatix_desktop.browser import ProjectTree
@@ -468,7 +469,9 @@ class MainWindow(QMainWindow):
         if self.store is None or project_id is None or version_id is None:
             return
         method, mv = self.store.method_version(version_id)
-        dialog = dialogs.MethodDialog(self, method.name, IntegrationParams(**mv.params), False)
+        dialog = dialogs.MethodDialog(
+            self, method.name, QuantMethod.from_dict(mv.params).integration, False
+        )
         if not dialog.exec():
             return
         reason = dialogs.ask_reason(self, "Change method", f"Reason for changing {method.name}:")

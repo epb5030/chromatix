@@ -119,6 +119,12 @@ def test_user_runs_the_workflow_under_their_own_name(pg, tmp_path):
             "permission denied for function",
         ),
         ("SELECT chromatix_current_user()", "permission denied for function"),
+        (
+            "INSERT INTO calibration (sample_set_id, method_version_id, component, model, "
+            "weighting, through_origin, coefficients, r_squared, points, created_at, created_by) "
+            "VALUES (1, 1, 'x', 'linear', 'none', false, '[]', 1, '[]', now(), 1)",
+            "permission denied",
+        ),
         ("DROP TRIGGER audit_event_append_only ON audit_event", "must be owner"),
         ("ALTER TABLE audit_event DISABLE TRIGGER ALL", "must be owner"),
         ("DROP FUNCTION chromatix_save_result(integer, integer, text, jsonb)", "must be owner"),
