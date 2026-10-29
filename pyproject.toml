@@ -1,0 +1,52 @@
+[project]
+name = "chromatix-workspace"
+version = "0.0.0"
+description = "ChromaTix workspace root (not published)"
+requires-python = ">=3.12"
+license = "AGPL-3.0-or-later"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "scipy-stubs>=1.14",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+chromatix-core = { workspace = true }
+chromatix-store = { workspace = true }
+chromatix-desktop = { workspace = true }
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "NPY", "SIM", "RUF"]
+# Typographic dashes/symbols are intentional in UI strings.
+allowed-confusables = ["–", "½"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["chromatix_core", "chromatix_store", "chromatix_desktop"]
+
+[tool.pytest.ini_options]
+testpaths = ["packages/core/tests", "packages/store/tests", "packages/desktop/tests"]
+addopts = "--import-mode=importlib"
+markers = ["gui: needs a Qt platform (runs offscreen)"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["chromatix_core", "chromatix_store"]
+mypy_path = ["packages/core/src", "packages/store/src"]
+
+[[tool.mypy.overrides]]
+module = ["netCDF4", "netCDF4.*"]
+ignore_missing_imports = true
