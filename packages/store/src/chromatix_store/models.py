@@ -134,6 +134,10 @@ class ResultPeak(Base):
     area: Mapped[float]
     width_50: Mapped[float | None]
     boundary: Mapped[str] = mapped_column(String(2))
+    # Baseline values at the peak start and end, so a stored result can be redrawn
+    # exactly as it was integrated.
+    baseline_start: Mapped[float]
+    baseline_end: Mapped[float]
 
 
 class AuditEvent(Base):

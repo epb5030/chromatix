@@ -139,7 +139,7 @@ version = "0.1.0.dev0"
 source = { editable = "packages/desktop" }
 dependencies = [
     { name = "chromatix-core" },
-    { name = "chromatix-store" },
+    { name = "chromatix-store", extra = ["postgres"] },
     { name = "pyqtgraph" },
     { name = "pyside6-essentials" },
 ]
@@ -147,7 +147,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "chromatix-core", editable = "packages/core" },
-    { name = "chromatix-store", editable = "packages/store" },
+    { name = "chromatix-store", extras = ["postgres"], editable = "packages/store" },
     { name = "pyqtgraph", specifier = ">=0.13.7" },
     { name = "pyside6-essentials", specifier = ">=6.8" },
 ]

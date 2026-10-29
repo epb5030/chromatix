@@ -32,7 +32,7 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "NPY", "SIM", "RUF"]
 # Typographic dashes/symbols are intentional in UI strings.
-allowed-confusables = ["–", "½"]
+allowed-confusables = ["–", "½", "×", "σ"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["chromatix_core", "chromatix_store", "chromatix_desktop"]

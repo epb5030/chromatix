@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import URL, Engine, create_engine, event, func, make_url, select, text
+from sqlalchemy import URL, Engine, Select, create_engine, event, func, make_url, select, text
 from sqlalchemy.orm import Session
 
 from chromatix_core import Chromatogram, IntegrationParams, integrate
@@ -439,6 +439,8 @@ class Store:
                         area=pk.area,
                         width_50=None if math.isnan(pk.width_50) else pk.width_50,
                         boundary=pk.boundary,
+                        baseline_start=pk.baseline_start,
+                        baseline_end=pk.baseline_end,
                     )
                 )
             self._audit(
@@ -454,29 +456,96 @@ class Store:
             )
             return result.id
 
-    def results(self, injection_id: int) -> list[Result]:
+    # ------------------------------------------------------------------ reads
+    def _all(self, query: Select[Any]) -> list[Any]:
         with Session(self.engine) as s:
-            return list(
-                s.scalars(
-                    select(Result)
-                    .where(Result.injection_id == injection_id)
-                    .order_by(Result.version)
-                )
+            return list(s.scalars(query))
+
+    def users(self) -> list[User]:
+        return self._all(select(User).order_by(User.username))
+
+    def projects(self) -> list[Project]:
+        return self._all(select(Project).order_by(Project.name))
+
+    def sample_sets(self, project_id: int) -> list[SampleSet]:
+        return self._all(
+            select(SampleSet).where(SampleSet.project_id == project_id).order_by(SampleSet.id)
+        )
+
+    def injections(self, sample_set_id: int) -> list[Injection]:
+        return self._all(
+            select(Injection)
+            .where(Injection.sample_set_id == sample_set_id)
+            .order_by(Injection.position)
+        )
+
+    def injection(self, injection_id: int) -> Injection:
+        with Session(self.engine) as s:
+            injection = s.get(Injection, injection_id)
+            if injection is None:
+                raise KeyError(injection_id)
+            return injection
+
+    def methods(self, project_id: int) -> list[tuple[ProcessingMethod, ProcessingMethodVersion]]:
+        """Each processing method of a project with its latest version."""
+        latest = (
+            select(
+                ProcessingMethodVersion.method_id,
+                func.max(ProcessingMethodVersion.version).label("version"),
             )
+            .group_by(ProcessingMethodVersion.method_id)
+            .subquery()
+        )
+        query = (
+            select(ProcessingMethod, ProcessingMethodVersion)
+            .join(ProcessingMethodVersion, ProcessingMethodVersion.method_id == ProcessingMethod.id)
+            .join(
+                latest,
+                (latest.c.method_id == ProcessingMethodVersion.method_id)
+                & (latest.c.version == ProcessingMethodVersion.version),
+            )
+            .where(ProcessingMethod.project_id == project_id)
+            .order_by(ProcessingMethod.name)
+        )
+        with Session(self.engine) as s:
+            return [(m, v) for m, v in s.execute(query)]
+
+    def method_versions(self, method_id: int) -> list[ProcessingMethodVersion]:
+        return self._all(
+            select(ProcessingMethodVersion)
+            .where(ProcessingMethodVersion.method_id == method_id)
+            .order_by(ProcessingMethodVersion.version)
+        )
+
+    def method_version(
+        self, method_version_id: int
+    ) -> tuple[ProcessingMethod, ProcessingMethodVersion]:
+        with Session(self.engine) as s:
+            mv = s.get(ProcessingMethodVersion, method_version_id)
+            if mv is None:
+                raise KeyError(method_version_id)
+            method = s.get(ProcessingMethod, mv.method_id)
+            assert method is not None
+            return method, mv
+
+    def results(self, injection_id: int) -> list[Result]:
+        return self._all(
+            select(Result).where(Result.injection_id == injection_id).order_by(Result.version)
+        )
 
     def peaks(self, result_id: int) -> list[ResultPeak]:
-        with Session(self.engine) as s:
-            return list(
-                s.scalars(
-                    select(ResultPeak)
-                    .where(ResultPeak.result_id == result_id)
-                    .order_by(ResultPeak.peak_number)
-                )
-            )
+        return self._all(
+            select(ResultPeak)
+            .where(ResultPeak.result_id == result_id)
+            .order_by(ResultPeak.peak_number)
+        )
 
-    def audit_trail(self, entity: str | None = None) -> list[AuditEvent]:
-        with Session(self.engine) as s:
-            query = select(AuditEvent).order_by(AuditEvent.id)
-            if entity:
-                query = query.where(AuditEvent.entity == entity)
-            return list(s.scalars(query))
+    def audit_trail(
+        self, entity: str | None = None, entity_id: object | None = None
+    ) -> list[AuditEvent]:
+        query = select(AuditEvent).order_by(AuditEvent.id)
+        if entity:
+            query = query.where(AuditEvent.entity == entity)
+        if entity_id is not None:
+            query = query.where(AuditEvent.entity_id == str(entity_id))
+        return self._all(query)

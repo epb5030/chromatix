@@ -18,15 +18,26 @@ with a tested processing engine and an audit-first data model.
   read-only raw files checked against their hash on every load; versioned
   processing methods and results; and an append-only audit trail enforced by
   database triggers. SQLite for one user, PostgreSQL for a shared lab.
-- **`chromatix-desktop`**: a native Qt window. Open a file (or demo data),
-  integrate it, and inspect baselines, drop lines and the peak table. No embedded
-  browser engine.
+- **`chromatix-desktop`**: a native Qt app with no embedded browser engine.
+  - Open a personal store (SQLite file) or connect to a shared one
+    (PostgreSQL). The password is asked for and never saved.
+  - Browse projects → sample sets → injections, and import AIA files into a
+    sample set.
+  - Edit processing methods; each saved change is a new version, and a
+    reason is required after the first.
+  - Process one injection or a whole sample set. Reprocessing asks for a reason
+    and keeps every earlier result version viewable.
+  - Review the audit trail.
+  - **Quick look** (File → Open file) integrates a single file without storing
+    anything.
 
 ## Run it
 
 ```bash
 uv sync --all-packages
-uv run chromatix                 # or: uv run chromatix path/to/file.cdf
+uv run chromatix                 # then File → Open personal store…
+uv run chromatix ~/lab.sqlite    # open a personal store directly (created if missing)
+uv run chromatix run.cdf         # quick look at one file
 uv run pytest                    # all tests (GUI test runs offscreen)
 # PostgreSQL store tests: point at any server you can create databases on
 CHROMATIX_TEST_POSTGRES_URL=postgresql://user:pass@localhost:5432/postgres uv run pytest
