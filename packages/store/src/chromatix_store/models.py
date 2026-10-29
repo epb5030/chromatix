@@ -14,7 +14,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any, ClassVar
 
-from sqlalchemy import JSON, ForeignKey, String, UniqueConstraint
+from sqlalchemy import JSON, DateTime, ForeignKey, String, UniqueConstraint
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -23,7 +24,12 @@ def utcnow() -> datetime:
 
 
 class Base(DeclarativeBase):
-    type_annotation_map: ClassVar[dict[Any, Any]] = {dict[str, Any]: JSON}
+    # All timestamps are UTC.  PostgreSQL stores them as timestamptz; SQLite has
+    # no time-zone type and returns them naive.
+    type_annotation_map: ClassVar[dict[Any, Any]] = {
+        dict[str, Any]: JSON().with_variant(JSONB(), "postgresql"),
+        datetime: DateTime(timezone=True),
+    }
 
 
 class User(Base):

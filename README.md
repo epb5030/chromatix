@@ -17,7 +17,7 @@ with a tested processing engine and an audit-first data model.
 - **`chromatix-store`**: Project → Sample Set → Injection; content-addressed,
   read-only raw files checked against their hash on every load; versioned
   processing methods and results; and an append-only audit trail enforced by
-  database triggers. SQLite now, PostgreSQL planned.
+  database triggers. SQLite for one user, PostgreSQL for a shared lab.
 - **`chromatix-desktop`**: a native Qt window. Open a file (or demo data),
   integrate it, and inspect baselines, drop lines and the peak table. No embedded
   browser engine.
@@ -28,6 +28,8 @@ with a tested processing engine and an audit-first data model.
 uv sync --all-packages
 uv run chromatix                 # or: uv run chromatix path/to/file.cdf
 uv run pytest                    # all tests (GUI test runs offscreen)
+# PostgreSQL store tests: point at any server you can create databases on
+CHROMATIX_TEST_POSTGRES_URL=postgresql://user:pass@localhost:5432/postgres uv run pytest
 uv run ruff check . && uv run mypy
 ```
 

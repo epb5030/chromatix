@@ -11,6 +11,19 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: chromatix
+          POSTGRES_PASSWORD: chromatix
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U chromatix"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -28,3 +41,5 @@ jobs:
       - run: uv run pytest -q
         env:
           QT_QPA_PLATFORM: offscreen
+          CHROMATIX_TEST_POSTGRES_URL: postgresql://chromatix:chromatix@localhost:5432/postgres
+          CHROMATIX_REQUIRE_POSTGRES: "1"
