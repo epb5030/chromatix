@@ -33,7 +33,7 @@ from collections.abc import Sequence
 from psycopg import sql
 from sqlalchemy import Engine, create_engine, make_url, text
 
-from chromatix_store import pg_functions
+from chromatix_store import migrate, pg_functions
 from chromatix_store.store import Store
 
 _ROLE_NAME = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
@@ -137,7 +137,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="chromatix-admin", description=__doc__.split("\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
 
-    init = sub.add_parser("init-postgres", help="create schema, triggers, write functions, grants")
+    init = sub.add_parser(
+        "init-postgres",
+        help="create or upgrade the schema (migrations), then (re)apply the group's grants",
+    )
     init.add_argument("--url", required=True, help="owner connection URL (no password in it)")
     init.add_argument("--group-role", "--app-role", dest="group_role", required=True)
     init.add_argument("--create-role", action="store_true", help="also create the group role")
@@ -148,16 +151,37 @@ def main(argv: Sequence[str] | None = None) -> int:
     add.add_argument("--username", required=True)
     add.add_argument("--full-name", default="")
 
+    status = sub.add_parser("status", help="show the store's schema revision")
+    status.add_argument("--url", required=True, help="connection URL (any role)")
+
+    new = sub.add_parser(
+        "new-migration", help="(developers) autogenerate a migration from model changes"
+    )
+    new.add_argument("message")
+
     args = parser.parse_args(argv)
+    if args.command == "new-migration":
+        migrate.new_revision(args.message)
+        return 0
     engine = _owner_engine(args.url)
     try:
         if args.command == "init-postgres":
+            before = migrate.current_revision(engine)
             if args.create_role:
                 create_group_role(engine, args.group_role)
             Store.initialize(engine)
             grant_group_role(engine, args.group_role)
             Store.verify_protection(engine)
-            print(f"initialised; group {args.group_role} may SELECT and call write functions only")
+            after = migrate.current_revision(engine)
+            change = "created" if before is None else ("upgraded" if before != after else "checked")
+            print(
+                f"schema {change} (revision {before or '-'} -> {after}); "
+                f"group {args.group_role} may SELECT and call write functions only"
+            )
+        elif args.command == "status":
+            current, head = migrate.current_revision(engine), migrate.head_revision()
+            state = "up to date" if current == head else "needs `init-postgres`"
+            print(f"store revision: {current or 'none'}; this ChromaTix: {head} ({state})")
         else:
             password = None
             if not _role_exists(engine, args.username):

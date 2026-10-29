@@ -113,6 +113,34 @@ functions, creating tables), a login outside the group, the database rejecting
 a reprocess without a reason when the function is called directly, and upgrading
 from the INSERT-based grants.
 
+### Schema migrations
+
+The schema is versioned with Alembic (`chromatix_store/migrations/`,
+`chromatix_store.migrate`).
+
+- **Revisions.** Revision `0001` is the baseline: the tables plus the SQLite and
+  PostgreSQL triggers and write functions. Later revisions are numbered
+  `0002`, `0003`, … in a single line with no branches.
+- **Migrations are frozen once merged.** Each one writes out its own trigger and
+  function SQL instead of importing it from application code, so replaying
+  history always gives the same database.
+- **Personal stores** upgrade automatically when opened. The SQLite file is first
+  copied to `<name>.sqlite.bak-<revision>-<UTC time>`.
+- **Shared stores** are upgraded only by the owner (`chromatix-admin
+  init-postgres`, which also re-applies the group's grants so new tables are
+  readable). `chromatix-admin status` shows the revision. Clients refuse a store
+  at a different revision than they expect (`StoreVersionError`), whether it is
+  older or newer.
+- **Stores from before migrations** are adopted (stamped `0001`) if they already
+  have the baseline layout. Older layouts are refused.
+- **No downgrades.** Going back would mean deleting history.
+- **A test guards the migrations.** It checks that a store built purely from
+  migrations has exactly the schema the models describe, on SQLite and
+  PostgreSQL, so a model change without a migration fails CI.
+- **New migrations** are created with `chromatix-admin new-migration "<message>"`.
+  It autogenerates from the models; then review the file and write out any
+  trigger or function SQL.
+
 ## Not yet covered (known gaps)
 
 - **Result content is computed on the client.** The database guarantees who
