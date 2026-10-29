@@ -1,0 +1,1 @@
+"""ChromaTix desktop application."""
