@@ -130,3 +130,28 @@ def test_unsupported_database_is_refused(tmp_path):
     engine = create_mock_engine("mysql://", executor=lambda *args, **kwargs: None)
     with pytest.raises(NotImplementedError, match="SQLite or PostgreSQL"):
         Store.create(engine, tmp_path, "analyst")
+
+
+def test_read_api(store, aia_file):
+    project, injection, method_v1 = _setup_injection(store, aia_file)
+    other = store.create_project("Another")
+    method_v2 = store.save_method_version(
+        project, "Default", IntegrationParams(threshold_snr=20), reason="tighter"
+    )
+    store.save_method_version(project, "Fast", IntegrationParams())
+    result = store.process_injection(injection, method_v2)
+
+    assert [p.name for p in store.projects()] == ["Another", "Assay dev"]
+    assert [u.username for u in store.users()] == ["analyst"]
+    (sample_set,) = store.sample_sets(project)
+    assert store.sample_sets(other) == []
+    assert [i.sample_name for i in store.injections(sample_set.id)] == ["Std 1"]
+    latest = {m.name: v.version for m, v in store.methods(project)}
+    assert latest == {"Default": 2, "Fast": 1}
+    method, mv = store.method_version(method_v2)
+    assert (method.name, mv.version, mv.params["threshold_snr"]) == ("Default", 2, 20)
+    assert [v.id for v in store.method_versions(method.id)] == [method_v1, method_v2]
+    peak = store.peaks(result)[0]
+    # The synthetic baseline is 2 + 0.5 t (+ noise).
+    assert peak.baseline_start == pytest.approx(2.0 + 0.5 * peak.start_time, abs=0.5)
+    assert [e.action for e in store.audit_trail("result", result)] == ["result.create"]
