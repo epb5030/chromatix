@@ -100,30 +100,37 @@ def test_process_and_reprocess_keeps_history(store, aia_file):
         "DELETE FROM raw_file",
     ],
 )
-def test_append_only_tables_reject_changes(store, aia_file, statement):
+def test_append_only_tables_reject_changes(store, owner_engine, aia_file, statement):
+    """The triggers stop even the owner (clients are already stopped by privileges)."""
     _, injection, method = _setup_injection(store, aia_file)
     store.process_injection(injection, method)
-    with pytest.raises(DBAPIError, match="append-only"), store.engine.begin() as conn:
+    with pytest.raises(DBAPIError, match="append-only"), owner_engine.begin() as conn:
         conn.execute(text(statement))
 
 
-def test_truncate_is_rejected_on_postgres(store, backend):
+def test_truncate_is_rejected_on_postgres(store, owner_engine, backend):
     if backend != "postgresql":
         pytest.skip("SQLite has no TRUNCATE")
-    with pytest.raises(DBAPIError, match="append-only"), store.engine.begin() as conn:
+    with pytest.raises(DBAPIError, match="append-only"), owner_engine.begin() as conn:
         conn.execute(text("TRUNCATE audit_event CASCADE"))
 
 
-def test_reopening_is_idempotent(store, backend, tmp_path):
+def test_reinitialising_is_idempotent(store, owner_engine):
     store.create_project("P")
-    again = Store.create(store.engine, store.data_dir, "analyst")
-    assert [e.action for e in again.audit_trail()] == ["user.create", "project.create"]
+    Store.initialize(owner_engine)
+    assert [e.action for e in store.audit_trail()] == ["user.create", "project.create"]
+    assert store.create_project("Q") > 0
 
 
 def test_unknown_user_cannot_write(make_store):
-    s = make_store("nobody")
+    s = make_store("nobody", create_account=False)
     with pytest.raises(PermissionError):
         s.create_project("x")
+
+
+def test_audit_records_the_acting_user(store):
+    store.create_project("P")
+    assert {e.username for e in store.audit_trail("project")} == {store.username}
 
 
 def test_unsupported_database_is_refused(tmp_path):
@@ -142,7 +149,7 @@ def test_read_api(store, aia_file):
     result = store.process_injection(injection, method_v2)
 
     assert [p.name for p in store.projects()] == ["Another", "Assay dev"]
-    assert [u.username for u in store.users()] == ["analyst"]
+    assert [u.username for u in store.users()] == [store.username]
     (sample_set,) = store.sample_sets(project)
     assert store.sample_sets(other) == []
     assert [i.sample_name for i in store.injections(sample_set.id)] == ["Std 1"]

@@ -171,3 +171,18 @@ def test_tampered_raw_file_is_reported(window, tmp_path, aia_files, errors):
     window.select(("sample_set", sample_set))
     window.select(("injection", injection))
     assert any("RawDataIntegrityError" in e for e in errors)
+
+
+def test_shared_dialog_uses_login_as_user(qapp, tmp_path):
+    dialog = dialogs.SharedStoreDialog(None, "postgresql://dbhost:5432/chromatix", str(tmp_path))
+    dialog.username.setText("jdoe")
+    dialog.password.setText("s3cret")
+    url, data_dir, username = dialog.connection()
+    assert (url.username, url.password, url.host, url.database) == (
+        "jdoe",
+        "s3cret",
+        "dbhost",
+        "chromatix",
+    )
+    assert username == "jdoe"
+    assert data_dir == tmp_path

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import json
 import math
 import os
 import shutil
@@ -14,10 +15,12 @@ from pathlib import Path
 from typing import Any
 
 from sqlalchemy import URL, Engine, Select, create_engine, event, func, make_url, select, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
 from chromatix_core import Chromatogram, IntegrationParams, integrate
 from chromatix_core.io import read_aia
+from chromatix_store import pg_functions
 from chromatix_store.models import (
     APPEND_ONLY_TABLES,
     AuditEvent,
@@ -137,6 +140,14 @@ class Store:
             cls.initialize(engine)
         else:
             cls.verify_protection(engine)
+        with engine.connect() as conn:
+            session_user = conn.scalar(text("SELECT session_user"))
+        if session_user != username:
+            engine.dispose()
+            raise PermissionError(
+                f"connected to PostgreSQL as {session_user!r} but working as {username!r}; "
+                "each ChromaTix user logs in with their own database role"
+            )
         path = Path(data_dir)
         (path / "objects").mkdir(parents=True, exist_ok=True)
         return cls(engine, path, username)
@@ -162,6 +173,21 @@ class Store:
         with engine.begin() as conn:
             for statement in _append_only_ddl(dialect):
                 conn.execute(text(statement))
+            if dialect == "postgresql":
+                # Write functions; nobody may call them until a group is granted EXECUTE.
+                # A raw cursor with no parameters, so psycopg leaves PL/pgSQL's % alone.
+                raw = conn.connection.dbapi_connection
+                assert raw is not None
+                cur = raw.cursor()
+                try:
+                    for statement in pg_functions.DDL:
+                        cur.execute(statement)
+                    for signature in (
+                        pg_functions.PUBLIC_FUNCTIONS + pg_functions.INTERNAL_FUNCTIONS
+                    ):
+                        cur.execute(f"REVOKE EXECUTE ON FUNCTION {signature} FROM PUBLIC")
+                finally:
+                    cur.close()
 
     @staticmethod
     def verify_protection(engine: Engine) -> None:
@@ -192,6 +218,25 @@ class Store:
                         "AND t.tgenabled <> 'D'"
                     )
                 )
+            )
+            definer = set(
+                conn.scalars(
+                    text(
+                        "SELECT p.proname FROM pg_proc p "
+                        "JOIN pg_namespace n ON n.oid = p.pronamespace "
+                        "WHERE n.nspname = current_schema() AND p.prosecdef"
+                    )
+                )
+            )
+        functions = {
+            sig.split("(")[0]
+            for sig in pg_functions.PUBLIC_FUNCTIONS + pg_functions.INTERNAL_FUNCTIONS
+        }
+        missing_functions = sorted(functions - definer)
+        if missing_functions:
+            raise ProtectionMissingError(
+                f"write functions are missing: {', '.join(missing_functions)}; "
+                "run `chromatix-admin init-postgres` as the owner role"
             )
         expected = {
             f"{table}_{suffix}"
@@ -236,6 +281,30 @@ class Store:
     def _object_path(self, sha256: str) -> Path:
         return self.data_dir / "objects" / sha256[:2] / sha256
 
+    @property
+    def _pg(self) -> bool:
+        return self.engine.dialect.name == "postgresql"
+
+    def _call(self, sql: str, **params: Any) -> Any:
+        """Run one PostgreSQL write function in its own transaction.
+
+        The function enforces attribution and reason rules itself; its error
+        codes are turned back into the same exceptions the SQLite path raises.
+        """
+        try:
+            with self.engine.begin() as conn:
+                return conn.execute(text(sql), params).scalar()
+        except DBAPIError as exc:
+            orig = exc.orig
+            code = getattr(orig, "sqlstate", None)
+            diag = getattr(orig, "diag", None)
+            message = getattr(diag, "message_primary", None) or str(orig)
+            if code == "CXR01":
+                raise ReasonRequiredError(message) from exc
+            if code == "CXU01":
+                raise PermissionError(message) from exc
+            raise
+
     # ------------------------------------------------------------------ users
     @staticmethod
     def add_user(engine: Engine, username: str, full_name: str = "") -> None:
@@ -254,6 +323,8 @@ class Store:
 
     # -------------------------------------------------------------- projects
     def create_project(self, name: str, description: str = "") -> int:
+        if self._pg:
+            return int(self._call("SELECT chromatix_create_project(:n, :d)", n=name, d=description))
         with self._tx() as (s, user):
             project = Project(name=name, description=description, created_by=user.id)
             s.add(project)
@@ -262,6 +333,10 @@ class Store:
             return project.id
 
     def create_sample_set(self, project_id: int, name: str) -> int:
+        if self._pg:
+            return int(
+                self._call("SELECT chromatix_create_sample_set(:p, :n)", p=project_id, n=name)
+            )
         with self._tx() as (s, user):
             ss = SampleSet(project_id=project_id, name=name, created_by=user.id)
             s.add(ss)
@@ -288,6 +363,15 @@ class Store:
                 raise RawDataIntegrityError(f"copy of {src} does not match its hash")
             tmp_path.chmod(0o444)
             tmp_path.replace(dest)
+        if self._pg:
+            self._call(
+                "SELECT chromatix_register_raw_file(:sha, :size, :name, :fmt)",
+                sha=sha,
+                size=src.stat().st_size,
+                name=src.name,
+                fmt=fmt,
+            )
+            return sha
         with self._tx() as (s, user):
             if s.get(RawFile, sha) is None:
                 s.add(
@@ -323,6 +407,18 @@ class Store:
         vial: str | None = None,
         amount: float | None = None,
     ) -> int:
+        if self._pg:
+            return int(
+                self._call(
+                    "SELECT chromatix_add_injection(:ss, :name, :sha, :type, :vial, :amount)",
+                    ss=sample_set_id,
+                    name=sample_name,
+                    sha=raw_file_sha256,
+                    type=sample_type,
+                    vial=vial,
+                    amount=amount,
+                )
+            )
         with self._tx() as (s, user):
             position = 1 + (
                 s.scalar(
@@ -359,6 +455,16 @@ class Store:
         self, project_id: int, name: str, params: IntegrationParams, reason: str = ""
     ) -> int:
         """Save ``params`` as the next version of method ``name``; returns the version id."""
+        if self._pg:
+            return int(
+                self._call(
+                    "SELECT chromatix_save_method_version(:p, :n, CAST(:params AS jsonb), :r)",
+                    p=project_id,
+                    n=name,
+                    params=json.dumps(dataclasses.asdict(params)),
+                    r=reason,
+                )
+            )
         with self._tx() as (s, user):
             method = s.scalar(
                 select(ProcessingMethod).where(
@@ -412,6 +518,31 @@ class Store:
             sha, params = inj.raw_file_sha256, IntegrationParams(**mv.params)
         peaks = integrate(self.load_chromatogram(sha), params)
 
+        if self._pg:
+            rows = [
+                {
+                    "peak_number": number,
+                    "retention_time": pk.retention_time,
+                    "start_time": pk.start_time,
+                    "end_time": pk.end_time,
+                    "height": pk.height,
+                    "area": pk.area,
+                    "width_50": None if math.isnan(pk.width_50) else pk.width_50,
+                    "boundary": pk.boundary,
+                    "baseline_start": pk.baseline_start,
+                    "baseline_end": pk.baseline_end,
+                }
+                for number, pk in enumerate(peaks, start=1)
+            ]
+            return int(
+                self._call(
+                    "SELECT chromatix_save_result(:inj, :mv, :r, CAST(:peaks AS jsonb))",
+                    inj=injection_id,
+                    mv=method_version_id,
+                    r=reason,
+                    peaks=json.dumps(rows),
+                )
+            )
         with self._tx() as (s, user):
             latest = s.scalar(
                 select(func.max(Result.version)).where(Result.injection_id == injection_id)

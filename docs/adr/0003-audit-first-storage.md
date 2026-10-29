@@ -65,39 +65,64 @@ in-memory store adds a system to validate and back up, and cannot be the record
 of truth. Revisit only if live acquisition needs high-rate streaming across
 machines, and even then raw data must reach disk first.
 
-### Roles
+### Roles and write path
 
-A shared deployment uses two PostgreSQL roles (`chromatix-admin`,
-`chromatix_store.admin`):
+A shared deployment uses three kinds of PostgreSQL role, managed with
+`chromatix-admin` (`chromatix_store.admin`):
 
-- **Owner.** Owns the database, tables and triggers; runs `init-postgres` and
-  `add-user`. It does not need to be a superuser: owning the database plus
-  CREATEROLE (to create the app role) is enough, and this setup was checked with
-  such a role. Its credentials are for administrators only, because an owner can
-  drop triggers.
-- **Application role.** What clients connect as. It gets SELECT on everything,
-  INSERT on the data tables, SELECT only on `user_account`, and USAGE on the
-  ID sequences. It has no UPDATE, DELETE or TRUNCATE privilege and owns
-  nothing, so it cannot ALTER or DROP tables or triggers. It also cannot CREATE
-  in the schema (revoked from PUBLIC as well).
-- **Start-up check.** `Store.open_postgres()` refuses to run
-  (`ProtectionMissingError`) unless every table exists and every append-only
-  trigger is present and enabled.
+- **Owner.** Owns the database, tables, triggers and write functions; runs
+  `init-postgres` and `add-user`. It does not need to be a superuser: owning the
+  database plus CREATEROLE is enough, and this setup was checked with such a
+  role. Its credentials are for administrators only, because an owner can drop
+  triggers.
+- **Client group** (NOLOGIN, e.g. `chromatix_users`). It gets SELECT on every
+  table and EXECUTE on the six write functions, and nothing else: no INSERT,
+  UPDATE, DELETE or TRUNCATE on any table, no ownership (so no ALTER or DROP),
+  and no CREATE in the schema. Re-running `init-postgres` also revokes INSERT
+  left over from the earlier single-app-role setup.
+- **Personal login per user.** Each ChromaTix user has a login role of the same
+  name that belongs to the group. PostgreSQL authenticates the person (password,
+  or LDAP/Kerberos configured on the server). `add-user` either creates the
+  login or adds an existing one, such as an LDAP-provisioned role, to the group.
 
-Tests cover each of these against PostgreSQL 17, including attempts by the app
-role to update, delete, truncate, drop or disable triggers, alter tables,
-create tables and add users.
+**All writes go through SECURITY DEFINER functions**
+(`chromatix_store.pg_functions`):
+
+- `create_project`, `create_sample_set`, `register_raw_file`, `add_injection`,
+  `save_method_version` and `save_result`.
+- Each function takes the user from `session_user`, enforces the reason rules
+  (SQLSTATE `CXR01`), numbers versions under a row lock, and writes the data row
+  together with its audit event.
+- The audit helper itself cannot be called by clients, and EXECUTE is revoked
+  from PUBLIC.
+- So on a shared store there is no way to add data without its audit entry,
+  add an audit entry without data, or record an action under someone else's
+  name.
+- The SQLite (personal) store keeps the equivalent Python write path. The same
+  test suite runs on both backends, so they cannot drift apart.
+
+**Start-up check.** `Store.open_postgres()` refuses to run
+(`ProtectionMissingError`) unless every table exists, every append-only trigger
+is present and enabled, and every write function exists as SECURITY DEFINER.
+It also refuses a ChromaTix username that differs from the database login.
+
+Tests cover all of this against PostgreSQL 17. They include 13 tampering
+attempts by a user (direct INSERT into data or audit tables, UPDATE, DELETE,
+TRUNCATE, calling the internal audit helper, dropping or disabling triggers or
+functions, creating tables), a login outside the group, the database rejecting
+a reprocess without a reason when the function is called directly, and upgrading
+from the INSERT-based grants.
 
 ## Not yet covered (known gaps)
 
-- **Direct inserts with the app credentials.** Someone holding the application
-  role's password could connect outside ChromaTix and INSERT rows directly,
-  including made-up audit events. They still cannot change or delete anything.
-  Closing this needs writes to go through SECURITY DEFINER functions that write
-  their own audit rows, or through a server that holds the credentials. Until
-  then, the application password should be held by the deployment, not by end
-  users.
-- **User authentication.** The store trusts the username it is given.
+- **Result content is computed on the client.** The database guarantees who
+  saved a result, when, with which method version and reason, but not that the
+  peaks really came from integrating the raw file. A user with a database login
+  could call `save_result` with numbers of their own. They would be recorded
+  under their own name, and earlier versions still cannot be changed. Closing
+  this needs integration to run server-side.
+- **Personal stores (SQLite)** have no authentication. The file belongs to one
+  operating-system user, and the store trusts the name it is given.
 - **Electronic signatures and sign-off levels.**
 - **Clock policy** (trusted time source) and **validation documentation.**
 
