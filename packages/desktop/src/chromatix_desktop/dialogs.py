@@ -104,7 +104,7 @@ class SharedStoreDialog(QDialog):
         self.setWindowTitle("Connect to shared store")
         form = QFormLayout(self)
         self.url = QLineEdit(url)
-        self.url.setPlaceholderText("postgresql://chromatix_app@dbhost/chromatix")
+        self.url.setPlaceholderText("postgresql://dbhost/chromatix")
         self.password = QLineEdit()
         self.password.setEchoMode(QLineEdit.EchoMode.Password)
         self.data_dir = QLineEdit(data_dir)
@@ -113,11 +113,12 @@ class SharedStoreDialog(QDialog):
         row = QHBoxLayout()
         row.addWidget(self.data_dir)
         row.addWidget(browse)
+        # Each ChromaTix user logs in with their own database role of the same name.
         self.username = QLineEdit(getpass.getuser())
         form.addRow("Database URL", self.url)
-        form.addRow("Database password", self.password)
+        form.addRow("Your login", self.username)
+        form.addRow("Password", self.password)
         form.addRow("Raw-data folder", row)
-        form.addRow("ChromaTix user", self.username)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -131,7 +132,10 @@ class SharedStoreDialog(QDialog):
             self.data_dir.setText(folder)
 
     def connection(self) -> tuple[URL, Path, str]:
+        """(URL with login and password, raw-data folder, ChromaTix username = login)."""
         url = make_url(self.url.text().strip())
+        login = self.username.text().strip() or url.username or ""
+        url = url.set(username=login)
         if self.password.text():
             url = url.set(password=self.password.text())
-        return url, Path(self.data_dir.text().strip()), self.username.text().strip()
+        return url, Path(self.data_dir.text().strip()), login
