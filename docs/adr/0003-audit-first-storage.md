@@ -1,7 +1,7 @@
-# 0003 — Audit-first data model; SQLite now, PostgreSQL next
+# 0003 — Audit-first data model on SQLite and PostgreSQL
 
-- Status: accepted (SQLite implemented; PostgreSQL planned)
-- Date: 2026-10-29
+- Status: accepted (SQLite and PostgreSQL implemented; database roles pending)
+- Date: 2026-10-29 (PostgreSQL added the same day)
 
 ## Context
 
@@ -33,16 +33,46 @@ database itself:
   raw-data directory for one user. PostgreSQL plus shared storage for a lab,
   with the same schema.
 
-## Status of PostgreSQL
+## PostgreSQL
 
-Not implemented yet. `Store.create()` raises `NotImplementedError` for any
-non-SQLite engine rather than ship untested triggers. Next steps: PL/pgSQL
-trigger equivalents, database roles (the app role gets INSERT/SELECT only on the
-append-only tables), and running the store test suite against a real PostgreSQL
-in CI.
+`Store.open_postgres(url, data_dir, username)` uses the psycopg 3 driver.
+
+- **Triggers.** The PL/pgSQL function `chromatix_append_only()` backs a
+  `BEFORE UPDATE OR DELETE … FOR EACH ROW` trigger and a `BEFORE TRUNCATE`
+  trigger on every append-only table. TRUNCATE has no SQLite equivalent.
+- **Types.** Timestamps are `timestamptz`, always written in UTC. JSON fields
+  are `jsonb`.
+- **Raw data** for a shared store lives in `data_dir`, which must be storage
+  every client can reach (NFS or SMB). Its integrity still rests on the SHA-256
+  check at load time.
+- **Tests.** The whole store suite runs against SQLite and a real PostgreSQL 17,
+  with a throwaway database per test. CI uses a `postgres:17` service container
+  and sets `CHROMATIX_REQUIRE_POSTGRES=1`, so a missing server fails the build
+  instead of skipping the tests.
+
+Concurrency: version numbers are allocated as `max + 1` inside the
+transaction. Two clients saving the same method or reprocessing the same
+injection at once will collide on the unique constraint and one gets an error;
+nothing is overwritten. Retry or locking can be added if that becomes an issue.
+
+### Why no Redis
+
+A task queue, cache or message bus is not needed. Background work runs in the
+desktop app's worker threads. If a shared server comes later, PostgreSQL itself
+can serve as the job queue (`SELECT … FOR UPDATE SKIP LOCKED`) and notify other
+clients (`LISTEN/NOTIFY`), inside the same transaction as the audit entry. An
+in-memory store adds a system to validate and back up, and cannot be the record
+of truth. Revisit only if live acquisition needs high-rate streaming across
+machines, and even then raw data must reach disk first.
 
 ## Not yet covered (known gaps)
 
-User authentication (the store trusts the username it is given), electronic
-signatures and sign-off levels, time-zone and clock policy, and validation
-documentation. These are needed before any GxP use.
+- **Database roles.** The triggers stop the application and anyone using its
+  credentials, but the table owner can still drop a trigger. A deployment needs
+  an owner role for migrations and a separate app role that has only
+  INSERT/SELECT on the append-only tables.
+- **User authentication.** The store trusts the username it is given.
+- **Electronic signatures and sign-off levels.**
+- **Clock policy** (trusted time source) and **validation documentation.**
+
+All of these are needed before any GxP use.

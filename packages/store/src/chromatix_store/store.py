@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import Engine, create_engine, event, func, select, text
+from sqlalchemy import URL, Engine, create_engine, event, func, make_url, select, text
 from sqlalchemy.orm import Session
 
 from chromatix_core import Chromatogram, IntegrationParams, integrate
@@ -59,6 +59,34 @@ def _sqlite_pragmas(dbapi_connection: Any, _record: Any) -> None:
     cursor.close()
 
 
+def _append_only_ddl(dialect: str) -> list[str]:
+    """Triggers that make :data:`APPEND_ONLY_TABLES` reject UPDATE/DELETE (and TRUNCATE)."""
+    if dialect == "sqlite":
+        return [
+            f"CREATE TRIGGER IF NOT EXISTS {table}_no_{op.lower()} "
+            f"BEFORE {op} ON {table} BEGIN "
+            f"SELECT RAISE(ABORT, '{table} is append-only'); END"
+            for table in APPEND_ONLY_TABLES
+            for op in ("UPDATE", "DELETE")
+        ]
+    statements = [
+        "CREATE OR REPLACE FUNCTION chromatix_append_only() RETURNS trigger "
+        "LANGUAGE plpgsql AS $$ BEGIN "
+        "RAISE EXCEPTION '% is append-only', TG_TABLE_NAME; "
+        "END $$"
+    ]
+    for table in APPEND_ONLY_TABLES:
+        statements += [
+            f"CREATE OR REPLACE TRIGGER {table}_append_only "
+            f"BEFORE UPDATE OR DELETE ON {table} "
+            "FOR EACH ROW EXECUTE FUNCTION chromatix_append_only()",
+            f"CREATE OR REPLACE TRIGGER {table}_no_truncate "
+            f"BEFORE TRUNCATE ON {table} "
+            "FOR EACH STATEMENT EXECUTE FUNCTION chromatix_append_only()",
+        ]
+    return statements
+
+
 class Store:
     """A ChromaTix database plus its content-addressed raw-data directory.
 
@@ -80,23 +108,31 @@ class Store:
         return cls.create(engine, base.with_suffix(".rawdata"), username)
 
     @classmethod
+    def open_postgres(
+        cls, url: str | URL, data_dir: str | os.PathLike[str], username: str
+    ) -> Store:
+        """Open (or create) a shared store in PostgreSQL.
+
+        ``data_dir`` holds the raw files and must be storage every client can
+        reach (e.g. an NFS or SMB share).  The psycopg 3 driver is used whatever
+        driver the URL names.
+        """
+        engine = create_engine(make_url(url).set(drivername="postgresql+psycopg"))
+        return cls.create(engine, Path(data_dir), username)
+
+    @classmethod
     def create(cls, engine: Engine, data_dir: Path, username: str) -> Store:
-        if engine.dialect.name != "sqlite":
+        dialect = engine.dialect.name
+        if dialect not in ("sqlite", "postgresql"):
             raise NotImplementedError(
-                "Only SQLite is implemented so far; PostgreSQL is planned (docs/adr/0003)."
+                f"unsupported database {dialect!r}: use SQLite or PostgreSQL (docs/adr/0003)"
             )
-        event.listen(engine, "connect", _sqlite_pragmas)
+        if dialect == "sqlite":
+            event.listen(engine, "connect", _sqlite_pragmas)
         Base.metadata.create_all(engine)
         with engine.begin() as conn:
-            for table in APPEND_ONLY_TABLES:
-                for op in ("UPDATE", "DELETE"):
-                    conn.execute(
-                        text(
-                            f"CREATE TRIGGER IF NOT EXISTS {table}_no_{op.lower()} "
-                            f"BEFORE {op} ON {table} BEGIN "
-                            f"SELECT RAISE(ABORT, '{table} is append-only'); END"
-                        )
-                    )
+            for statement in _append_only_ddl(dialect):
+                conn.execute(text(statement))
         (data_dir / "objects").mkdir(parents=True, exist_ok=True)
         return cls(engine, data_dir, username)
 

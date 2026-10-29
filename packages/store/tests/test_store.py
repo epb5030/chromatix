@@ -14,13 +14,6 @@ PEAKS = [GaussianPeak(2.0, 100, 0.05), GaussianPeak(4.0, 40, 0.04), GaussianPeak
 
 
 @pytest.fixture
-def store(tmp_path):
-    s = Store.open_sqlite(tmp_path / "lab", username="analyst")
-    Store.add_user(s.engine, "analyst", "A. Analyst")
-    return s
-
-
-@pytest.fixture
 def aia_file(tmp_path):
     path = tmp_path / "inj1.cdf"
     write_aia(gaussian_chromatogram(PEAKS, offset=2, drift=0.5, noise=0.3, seed=1), path)
@@ -114,13 +107,26 @@ def test_append_only_tables_reject_changes(store, aia_file, statement):
         conn.execute(text(statement))
 
 
-def test_unknown_user_cannot_write(tmp_path):
-    s = Store.open_sqlite(tmp_path / "lab", username="nobody")
+def test_truncate_is_rejected_on_postgres(store, backend):
+    if backend != "postgresql":
+        pytest.skip("SQLite has no TRUNCATE")
+    with pytest.raises(DBAPIError, match="append-only"), store.engine.begin() as conn:
+        conn.execute(text("TRUNCATE audit_event CASCADE"))
+
+
+def test_reopening_is_idempotent(store, backend, tmp_path):
+    store.create_project("P")
+    again = Store.create(store.engine, store.data_dir, "analyst")
+    assert [e.action for e in again.audit_trail()] == ["user.create", "project.create"]
+
+
+def test_unknown_user_cannot_write(make_store):
+    s = make_store("nobody")
     with pytest.raises(PermissionError):
         s.create_project("x")
 
 
-def test_postgres_not_yet_supported(tmp_path):
-    engine = create_mock_engine("postgresql://", executor=lambda *args, **kwargs: None)
-    with pytest.raises(NotImplementedError, match="adr/0003"):
+def test_unsupported_database_is_refused(tmp_path):
+    engine = create_mock_engine("mysql://", executor=lambda *args, **kwargs: None)
+    with pytest.raises(NotImplementedError, match="SQLite or PostgreSQL"):
         Store.create(engine, tmp_path, "analyst")
