@@ -45,6 +45,10 @@ class ReasonRequiredError(ValueError):
     """Changing existing data (e.g. reprocessing) needs a documented reason."""
 
 
+class ProtectionMissingError(RuntimeError):
+    """The database is uninitialised, or its append-only triggers are missing or disabled."""
+
+
 def _sha256(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -109,19 +113,44 @@ class Store:
 
     @classmethod
     def open_postgres(
-        cls, url: str | URL, data_dir: str | os.PathLike[str], username: str
+        cls,
+        url: str | URL,
+        data_dir: str | os.PathLike[str],
+        username: str,
+        *,
+        initialize: bool = False,
     ) -> Store:
-        """Open (or create) a shared store in PostgreSQL.
+        """Open a shared store in PostgreSQL.
+
+        By default this only connects, and refuses to run unless the schema and
+        every append-only trigger are in place (see :meth:`verify_protection`).
+        The application should connect as a restricted role (see
+        :mod:`chromatix_store.admin`); ``initialize=True`` creates the schema and
+        must be run by the owner role.
 
         ``data_dir`` holds the raw files and must be storage every client can
         reach (e.g. an NFS or SMB share).  The psycopg 3 driver is used whatever
         driver the URL names.
         """
         engine = create_engine(make_url(url).set(drivername="postgresql+psycopg"))
-        return cls.create(engine, Path(data_dir), username)
+        if initialize:
+            cls.initialize(engine)
+        else:
+            cls.verify_protection(engine)
+        path = Path(data_dir)
+        (path / "objects").mkdir(parents=True, exist_ok=True)
+        return cls(engine, path, username)
 
     @classmethod
     def create(cls, engine: Engine, data_dir: Path, username: str) -> Store:
+        """Initialise the schema (idempotent) and open the store."""
+        cls.initialize(engine)
+        (data_dir / "objects").mkdir(parents=True, exist_ok=True)
+        return cls(engine, data_dir, username)
+
+    @staticmethod
+    def initialize(engine: Engine) -> None:
+        """Create tables and append-only triggers.  Safe to run again."""
         dialect = engine.dialect.name
         if dialect not in ("sqlite", "postgresql"):
             raise NotImplementedError(
@@ -133,8 +162,47 @@ class Store:
         with engine.begin() as conn:
             for statement in _append_only_ddl(dialect):
                 conn.execute(text(statement))
-        (data_dir / "objects").mkdir(parents=True, exist_ok=True)
-        return cls(engine, data_dir, username)
+
+    @staticmethod
+    def verify_protection(engine: Engine) -> None:
+        """Raise :class:`ProtectionMissingError` unless every table exists and every
+        append-only trigger is present and enabled (PostgreSQL)."""
+        with engine.connect() as conn:
+            tables = set(
+                conn.scalars(
+                    text(
+                        "SELECT table_name FROM information_schema.tables "
+                        "WHERE table_schema = current_schema()"
+                    )
+                )
+            )
+            missing_tables = sorted(set(Base.metadata.tables) - tables)
+            if missing_tables:
+                raise ProtectionMissingError(
+                    f"database is not initialised (missing tables: {', '.join(missing_tables)}); "
+                    "run `chromatix-admin init-postgres` as the owner role"
+                )
+            enabled = set(
+                conn.scalars(
+                    text(
+                        "SELECT t.tgname FROM pg_trigger t "
+                        "JOIN pg_class c ON c.oid = t.tgrelid "
+                        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                        "WHERE n.nspname = current_schema() AND NOT t.tgisinternal "
+                        "AND t.tgenabled <> 'D'"
+                    )
+                )
+            )
+        expected = {
+            f"{table}_{suffix}"
+            for table in APPEND_ONLY_TABLES
+            for suffix in ("append_only", "no_truncate")
+        }
+        missing = sorted(expected - enabled)
+        if missing:
+            raise ProtectionMissingError(
+                f"append-only protection is missing or disabled: {', '.join(missing)}"
+            )
 
     # ---------------------------------------------------------------- helpers
     @contextmanager

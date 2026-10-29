@@ -1,5 +1,10 @@
 """ChromaTix storage layer."""
 
-from chromatix_store.store import RawDataIntegrityError, ReasonRequiredError, Store
+from chromatix_store.store import (
+    ProtectionMissingError,
+    RawDataIntegrityError,
+    ReasonRequiredError,
+    Store,
+)
 
-__all__ = ["RawDataIntegrityError", "ReasonRequiredError", "Store"]
+__all__ = ["ProtectionMissingError", "RawDataIntegrityError", "ReasonRequiredError", "Store"]
