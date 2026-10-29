@@ -35,6 +35,26 @@ uv run ruff check . && uv run mypy
 
 Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/).
 
+## Shared lab database (PostgreSQL)
+
+Run these as an **owner** role that owns the database and has CREATEROLE. It
+doesn't need to be a superuser. ChromaTix clients then connect as the
+restricted **app** role, which can read and add records but never change or
+delete them.
+
+```bash
+createdb -O lab_owner chromatix
+CHROMATIX_APP_PASSWORD=... uv run chromatix-admin init-postgres \
+    --url postgresql://lab_owner@dbhost/chromatix --app-role chromatix_app --create-role
+uv run chromatix-admin add-user --url postgresql://lab_owner@dbhost/chromatix \
+    --username jdoe --full-name "J. Doe"
+```
+
+Pass the app-role password through `CHROMATIX_APP_PASSWORD` or the prompt, not on
+the command line. Raw data lives in a directory every client can reach (an NFS
+or SMB share). The details and known gaps are in
+[ADR 0003](docs/adr/0003-audit-first-storage.md).
+
 ## Design decisions
 
 See [`docs/adr/`](docs/adr/):

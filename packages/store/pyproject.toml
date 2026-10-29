@@ -12,6 +12,9 @@ dependencies = [
 [project.optional-dependencies]
 postgres = ["psycopg[binary]>=3.2"]
 
+[project.scripts]
+chromatix-admin = "chromatix_store.admin:main"
+
 [build-system]
 requires = ["hatchling>=1.26"]
 build-backend = "hatchling.build"

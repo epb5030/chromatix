@@ -1,6 +1,6 @@
 # 0003 — Audit-first data model on SQLite and PostgreSQL
 
-- Status: accepted (SQLite and PostgreSQL implemented; database roles pending)
+- Status: accepted (SQLite and PostgreSQL implemented, with owner/application roles)
 - Date: 2026-10-29 (PostgreSQL added the same day)
 
 ## Context
@@ -65,12 +65,38 @@ in-memory store adds a system to validate and back up, and cannot be the record
 of truth. Revisit only if live acquisition needs high-rate streaming across
 machines, and even then raw data must reach disk first.
 
+### Roles
+
+A shared deployment uses two PostgreSQL roles (`chromatix-admin`,
+`chromatix_store.admin`):
+
+- **Owner.** Owns the database, tables and triggers; runs `init-postgres` and
+  `add-user`. It does not need to be a superuser: owning the database plus
+  CREATEROLE (to create the app role) is enough, and this setup was checked with
+  such a role. Its credentials are for administrators only, because an owner can
+  drop triggers.
+- **Application role.** What clients connect as. It gets SELECT on everything,
+  INSERT on the data tables, SELECT only on `user_account`, and USAGE on the
+  ID sequences. It has no UPDATE, DELETE or TRUNCATE privilege and owns
+  nothing, so it cannot ALTER or DROP tables or triggers. It also cannot CREATE
+  in the schema (revoked from PUBLIC as well).
+- **Start-up check.** `Store.open_postgres()` refuses to run
+  (`ProtectionMissingError`) unless every table exists and every append-only
+  trigger is present and enabled.
+
+Tests cover each of these against PostgreSQL 17, including attempts by the app
+role to update, delete, truncate, drop or disable triggers, alter tables,
+create tables and add users.
+
 ## Not yet covered (known gaps)
 
-- **Database roles.** The triggers stop the application and anyone using its
-  credentials, but the table owner can still drop a trigger. A deployment needs
-  an owner role for migrations and a separate app role that has only
-  INSERT/SELECT on the append-only tables.
+- **Direct inserts with the app credentials.** Someone holding the application
+  role's password could connect outside ChromaTix and INSERT rows directly,
+  including made-up audit events. They still cannot change or delete anything.
+  Closing this needs writes to go through SECURITY DEFINER functions that write
+  their own audit rows, or through a server that holds the credentials. Until
+  then, the application password should be held by the deployment, not by end
+  users.
 - **User authentication.** The store trusts the username it is given.
 - **Electronic signatures and sign-off levels.**
 - **Clock policy** (trusted time source) and **validation documentation.**

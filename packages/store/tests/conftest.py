@@ -40,7 +40,9 @@ def make_store(backend, tmp_path, request):
         admin = create_engine(admin_url, isolation_level="AUTOCOMMIT")
         with admin.connect() as conn:
             conn.execute(text(f'CREATE DATABASE "{name}"'))
-        store = Store.open_postgres(admin_url.set(database=name), tmp_path / "rawdata", username)
+        store = Store.open_postgres(
+            admin_url.set(database=name), tmp_path / "rawdata", username, initialize=True
+        )
 
         def drop() -> None:
             store.engine.dispose()
