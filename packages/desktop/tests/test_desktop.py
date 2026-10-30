@@ -5,8 +5,9 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import shiboken6
 from PySide6.QtCore import QSettings
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
 
 from chromatix_core import IntegrationParams
 from chromatix_core.io import write_aia
@@ -29,6 +30,18 @@ def qapp(tmp_path_factory):
         str(tmp_path_factory.mktemp("settings")),
     )
     return QApplication.instance() or QApplication([])
+
+
+@pytest.fixture
+def parent(qapp):
+    """Parent widget for dialogs, destroyed while the QApplication still exists.
+
+    Unparented dialogs (with widgets inside table cells) otherwise get torn down
+    during interpreter exit, after QApplication, which crashes intermittently.
+    """
+    widget = QWidget()
+    yield widget
+    shiboken6.delete(widget)
 
 
 @pytest.fixture
@@ -176,8 +189,8 @@ def test_tampered_raw_file_is_reported(window, tmp_path, aia_files, errors):
     assert any("RawDataIntegrityError" in e for e in errors)
 
 
-def test_shared_dialog_uses_login_as_user(qapp, tmp_path):
-    dialog = dialogs.SharedStoreDialog(None, "postgresql://dbhost:5432/chromatix", str(tmp_path))
+def test_shared_dialog_uses_login_as_user(parent, tmp_path):
+    dialog = dialogs.SharedStoreDialog(parent, "postgresql://dbhost:5432/chromatix", str(tmp_path))
     dialog.username.setText("jdoe")
     dialog.password.setText("s3cret")
     url, data_dir, username = dialog.connection()
@@ -257,17 +270,17 @@ def test_calibration_workflow(window, tmp_path, errors):
     assert "n = 4" in summary
 
 
-def test_method_dialog_round_trip(qapp):
-    dialog = dialogs.MethodDialog(None, "Quant", QUANT, False)
+def test_method_dialog_round_trip(parent):
+    dialog = dialogs.MethodDialog(parent, "Quant", QUANT, False)
     assert dialog.method() == QUANT
     dialog.add_component(Component("Caffeine", 3.0))
     with pytest.raises(ValueError, match="unique"):
         dialog.method()
 
 
-def test_import_dialog_details(qapp, tmp_path):
+def test_import_dialog_details(parent, tmp_path):
     files = [(tmp_path / "a.cdf", "Std 1"), (tmp_path / "b.cdf", "Sample")]
-    dialog = dialogs.ImportDialog(None, files, QUANT.components)
+    dialog = dialogs.ImportDialog(parent, files, QUANT.components)
     dialog.table.item(0, 3).setText("1.5")
     details = dialog.details()
     assert details[0] == {
