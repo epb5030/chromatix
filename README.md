@@ -42,9 +42,15 @@ uv run pytest                    # all tests (GUI test runs offscreen)
 # PostgreSQL store tests: point at any server you can create databases on
 CHROMATIX_TEST_POSTGRES_URL=postgresql://user:pass@localhost:5432/postgres uv run pytest
 uv run ruff check . && uv run mypy
+uv run chromatix-admin new-migration "describe the change"   # after changing models.py
 ```
 
 Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/).
+
+Stores are versioned. A personal store upgrades itself when opened, after
+saving a backup copy next to it. A shared store is upgraded by its owner with
+`chromatix-admin init-postgres`. Use `chromatix-admin status --url …` to see a
+store's version.
 
 ## Shared lab database (PostgreSQL)
 

@@ -59,6 +59,7 @@ from chromatix_store import (
     RawDataIntegrityError,
     ReasonRequiredError,
     Store,
+    StoreVersionError,
 )
 
 AUDIT_COLUMNS = ("Time (UTC)", "User", "Action", "Entity", "ID", "Reason", "Details")
@@ -68,6 +69,7 @@ _EXPECTED_ERRORS = (
     PermissionError,
     ProtectionMissingError,
     RawDataIntegrityError,
+    StoreVersionError,
     SQLAlchemyError,
     OSError,
     ValueError,

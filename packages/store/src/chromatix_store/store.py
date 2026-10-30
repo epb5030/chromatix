@@ -11,6 +11,7 @@ import shutil
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +21,7 @@ from sqlalchemy.orm import Session
 
 from chromatix_core import Chromatogram, IntegrationParams, integrate
 from chromatix_core.io import read_aia
-from chromatix_store import pg_functions
+from chromatix_store import migrate, pg_functions
 from chromatix_store.models import (
     APPEND_ONLY_TABLES,
     AuditEvent,
@@ -66,34 +67,6 @@ def _sqlite_pragmas(dbapi_connection: Any, _record: Any) -> None:
     cursor.close()
 
 
-def _append_only_ddl(dialect: str) -> list[str]:
-    """Triggers that make :data:`APPEND_ONLY_TABLES` reject UPDATE/DELETE (and TRUNCATE)."""
-    if dialect == "sqlite":
-        return [
-            f"CREATE TRIGGER IF NOT EXISTS {table}_no_{op.lower()} "
-            f"BEFORE {op} ON {table} BEGIN "
-            f"SELECT RAISE(ABORT, '{table} is append-only'); END"
-            for table in APPEND_ONLY_TABLES
-            for op in ("UPDATE", "DELETE")
-        ]
-    statements = [
-        "CREATE OR REPLACE FUNCTION chromatix_append_only() RETURNS trigger "
-        "LANGUAGE plpgsql AS $$ BEGIN "
-        "RAISE EXCEPTION '% is append-only', TG_TABLE_NAME; "
-        "END $$"
-    ]
-    for table in APPEND_ONLY_TABLES:
-        statements += [
-            f"CREATE OR REPLACE TRIGGER {table}_append_only "
-            f"BEFORE UPDATE OR DELETE ON {table} "
-            "FOR EACH ROW EXECUTE FUNCTION chromatix_append_only()",
-            f"CREATE OR REPLACE TRIGGER {table}_no_truncate "
-            f"BEFORE TRUNCATE ON {table} "
-            "FOR EACH STATEMENT EXECUTE FUNCTION chromatix_append_only()",
-        ]
-    return statements
-
-
 class Store:
     """A ChromaTix database plus its content-addressed raw-data directory.
 
@@ -109,9 +82,18 @@ class Store:
     # ------------------------------------------------------------------ setup
     @classmethod
     def open_sqlite(cls, path: str | os.PathLike[str], username: str) -> Store:
-        """Open (or create) a personal store: ``<path>.sqlite`` + ``<path>.rawdata/``."""
+        """Open (or create) a personal store: ``<path>.sqlite`` + ``<path>.rawdata/``.
+
+        An existing store that needs a schema upgrade is copied to
+        ``<path>.sqlite.bak-<revision>-<UTC time>`` first.
+        """
         base = Path(path)
-        engine = create_engine(f"sqlite:///{base.with_suffix('.sqlite')}")
+        db_file = base.with_suffix(".sqlite")
+        engine = create_engine(f"sqlite:///{db_file}")
+        if db_file.exists() and migrate.needs_upgrade(engine):
+            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+            revision = migrate.current_revision(engine) or "unversioned"
+            shutil.copy2(db_file, db_file.with_name(f"{db_file.name}.bak-{revision}-{stamp}"))
         return cls.create(engine, base.with_suffix(".rawdata"), username)
 
     @classmethod
@@ -161,7 +143,11 @@ class Store:
 
     @staticmethod
     def initialize(engine: Engine) -> None:
-        """Create tables and append-only triggers.  Safe to run again."""
+        """Create or upgrade the schema to the current revision (see :mod:`.migrate`).
+
+        Tables, append-only triggers and PostgreSQL write functions all come from
+        the migrations.  Safe to run again.
+        """
         dialect = engine.dialect.name
         if dialect not in ("sqlite", "postgresql"):
             raise NotImplementedError(
@@ -169,30 +155,19 @@ class Store:
             )
         if dialect == "sqlite":
             event.listen(engine, "connect", _sqlite_pragmas)
-        Base.metadata.create_all(engine)
-        with engine.begin() as conn:
-            for statement in _append_only_ddl(dialect):
-                conn.execute(text(statement))
-            if dialect == "postgresql":
-                # Write functions; nobody may call them until a group is granted EXECUTE.
-                # A raw cursor with no parameters, so psycopg leaves PL/pgSQL's % alone.
-                raw = conn.connection.dbapi_connection
-                assert raw is not None
-                cur = raw.cursor()
-                try:
-                    for statement in pg_functions.DDL:
-                        cur.execute(statement)
-                    for signature in (
-                        pg_functions.PUBLIC_FUNCTIONS + pg_functions.INTERNAL_FUNCTIONS
-                    ):
-                        cur.execute(f"REVOKE EXECUTE ON FUNCTION {signature} FROM PUBLIC")
-                finally:
-                    cur.close()
+        migrate.upgrade(engine)
 
     @staticmethod
     def verify_protection(engine: Engine) -> None:
-        """Raise :class:`ProtectionMissingError` unless every table exists and every
-        append-only trigger is present and enabled (PostgreSQL)."""
+        """Refuse a shared store unless it is at this version's schema revision, every
+        table exists, every append-only trigger is enabled and every write function
+        is present (PostgreSQL)."""
+        current, head = migrate.current_revision(engine), migrate.head_revision()
+        if current is not None and current != head:
+            raise migrate.StoreVersionError(
+                f"store schema is at revision {current}, this ChromaTix expects {head}; "
+                "the owner must run `chromatix-admin init-postgres` (or update ChromaTix)"
+            )
         with engine.connect() as conn:
             tables = set(
                 conn.scalars(
