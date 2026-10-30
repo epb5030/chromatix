@@ -10,10 +10,11 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 
 from chromatix_core import IntegrationParams
 from chromatix_core.io import write_aia
+from chromatix_core.quant import Component, ProcessingMethod
 from chromatix_core.synthetic import GaussianPeak, gaussian_chromatogram
 from chromatix_desktop import dialogs
 from chromatix_desktop.app import MainWindow
-from chromatix_desktop.plot import TYPE_COLUMN
+from chromatix_desktop.plot import AMOUNT_COLUMN, COMPONENT_COLUMN, TYPE_COLUMN
 
 pytestmark = pytest.mark.gui
 
@@ -118,7 +119,8 @@ def test_store_workflow(window, tmp_path, aia_files, reasons, errors):
     window.select(("sample_set", sample_set))
     window._process_sample_set_action()
     assert [len(store.results(i)) for i in injections] == [3, 1]
-    assert [r.reason for r in store.results(injections[1])] == [""]
+    # One processing run, one reason: it is recorded on every result it writes.
+    assert [r.reason for r in store.results(injections[1])] == ["batch rerun"]
 
     actions = [window.audit_table.item(r, 2).text() for r in range(window.audit_table.rowCount())]
     assert actions[0] == "result.create"  # newest first
@@ -187,3 +189,94 @@ def test_shared_dialog_uses_login_as_user(qapp, tmp_path):
     )
     assert username == "jdoe"
     assert data_dir == tmp_path
+
+
+QUANT = ProcessingMethod(
+    IntegrationParams(),
+    (
+        Component("Caffeine", 2.0, window=0.1, unit="ug/mL"),
+        Component("Theobromine", 5.0, window=0.1, unit="ug/mL"),
+    ),
+)
+
+
+def _quant_file(path, caffeine, theobromine, seed):
+    peaks = [
+        GaussianPeak(2.0, 40 * caffeine, 0.05),
+        GaussianPeak(5.0, 25 * theobromine, 0.06),
+    ]
+    write_aia(gaussian_chromatogram(peaks, offset=2, drift=0.5, noise=0.3, seed=seed), path)
+    return path
+
+
+def test_calibration_workflow(window, tmp_path, errors):
+    window.open_personal_store(tmp_path / "lab", "tester")
+    project = window.create_project("Assay")
+    window.select(("project", project))
+    method = window.save_method(project, "Quant", QUANT)
+    sample_set = window.create_sample_set(project, "SS")
+    paths, details = [], []
+    for i, level in enumerate((1.0, 2.0, 4.0, 8.0)):
+        paths.append(_quant_file(tmp_path / f"std{i}.cdf", level, level / 2, seed=i))
+        details.append(
+            {
+                "sample_name": f"Std {level}",
+                "sample_type": "standard",
+                "amounts": {"Caffeine": level, "Theobromine": level / 2},
+            }
+        )
+    paths.append(_quant_file(tmp_path / "unk.cdf", 3.0, 1.5, seed=40))
+    details.append({"sample_name": "Sample A", "sample_type": "unknown", "amounts": None})
+    injections = window.import_files(sample_set, paths, details)
+    assert errors == []
+
+    window.select(("sample_set", sample_set))
+    window.method_combo.setCurrentIndex(window.method_combo.findData(method))
+    window._process_sample_set_action()
+    assert errors == []
+    assert "calibrated Caffeine, Theobromine" in window.statusBar().currentMessage()
+
+    window.select(("injection", injections[-1]))
+    table = window.peak_table
+    by_component = {
+        table.item(r, COMPONENT_COLUMN).text(): float(table.item(r, AMOUNT_COLUMN).text())
+        for r in range(table.rowCount())
+        if table.item(r, COMPONENT_COLUMN).text()
+    }
+    assert by_component["Caffeine"] == pytest.approx(3.0, rel=0.03)
+    assert by_component["Theobromine"] == pytest.approx(1.5, rel=0.03)
+
+    view = window.calibration_view
+    assert [view.component.itemText(i) for i in range(view.component.count())] == [
+        "Caffeine",
+        "Theobromine",
+    ]
+    summary = view.summary.text()
+    r_squared = float(summary.split("R² = ")[1].split()[0])
+    assert r_squared >= 0.999
+    assert "n = 4" in summary
+
+
+def test_method_dialog_round_trip(qapp):
+    dialog = dialogs.MethodDialog(None, "Quant", QUANT, False)
+    assert dialog.method() == QUANT
+    dialog.add_component(Component("Caffeine", 3.0))
+    with pytest.raises(ValueError, match="unique"):
+        dialog.method()
+
+
+def test_import_dialog_details(qapp, tmp_path):
+    files = [(tmp_path / "a.cdf", "Std 1"), (tmp_path / "b.cdf", "Sample")]
+    dialog = dialogs.ImportDialog(None, files, QUANT.components)
+    dialog.table.item(0, 3).setText("1.5")
+    details = dialog.details()
+    assert details[0] == {
+        "sample_name": "Std 1",
+        "sample_type": "standard",
+        "amounts": {"Caffeine": 1.5},
+    }
+    assert details[1]["sample_type"] == "unknown"
+    assert details[1]["amounts"] is None
+    dialog.table.item(1, 4).setText("lots")
+    with pytest.raises(ValueError, match="not a number"):
+        dialog.details()

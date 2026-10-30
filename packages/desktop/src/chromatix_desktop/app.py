@@ -20,7 +20,7 @@ import functools
 import getpass
 import json
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -50,11 +50,12 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from chromatix_core import Chromatogram, IntegrationParams, integrate
 from chromatix_core.io import read_aia
+from chromatix_core.quant import Component
 from chromatix_core.quant import ProcessingMethod as QuantMethod
 from chromatix_core.synthetic import GaussianPeak, gaussian_chromatogram
 from chromatix_desktop import dialogs
 from chromatix_desktop.browser import ProjectTree
-from chromatix_desktop.plot import ChromatogramPlot, PeakTable
+from chromatix_desktop.plot import CalibrationView, ChromatogramPlot, PeakTable
 from chromatix_store import (
     ProtectionMissingError,
     RawDataIntegrityError,
@@ -62,6 +63,7 @@ from chromatix_store import (
     Store,
     StoreVersionError,
 )
+from chromatix_store.store import SampleSetProcessing
 
 AUDIT_COLUMNS = ("Time (UTC)", "User", "Action", "Entity", "ID", "Reason", "Details")
 DEFAULT_METHOD = "Default"
@@ -127,13 +129,16 @@ class MainWindow(QMainWindow):
         self.audit_table = QTableWidget(0, len(AUDIT_COLUMNS))
         self.audit_table.setHorizontalHeaderLabels(AUDIT_COLUMNS)
         self.audit_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.calibration_view = CalibrationView()
         self.tabs = QTabWidget()
         self.tabs.addTab(self.peak_table, "Peaks")
+        self.tabs.addTab(self.calibration_view, "Calibration")
         self.tabs.addTab(self.audit_table, "Audit trail")
 
         # Processing bar: method + process buttons + result version.
         self.method_combo = QComboBox()
         self.method_combo.setMinimumWidth(180)
+        self.method_combo.currentIndexChanged.connect(self.refresh_calibration)
         self.result_combo = QComboBox()
         self.result_combo.setMinimumWidth(320)
         self.result_combo.currentIndexChanged.connect(self._show_selected_result)
@@ -279,26 +284,71 @@ class MainWindow(QMainWindow):
         return sample_set_id
 
     @guarded
-    def import_files(self, sample_set_id: int, paths: Sequence[str | Path]) -> list[int]:
-        """Import AIA files as new injections, named after the file's sample_name."""
+    def import_files(
+        self,
+        sample_set_id: int,
+        paths: Sequence[str | Path],
+        details: Sequence[Mapping[str, Any]] | None = None,
+    ) -> list[int]:
+        """Import AIA files as new injections.
+
+        ``details`` (one per file, from the import dialog) gives sample_name,
+        sample_type and known component amounts; without it, injections are
+        unknowns named after the file's sample_name.
+        """
         store = self._require_store()
         ids = []
-        for path in map(Path, paths):
+        for i, path in enumerate(map(Path, paths)):
             sha = store.import_raw_file(path)
-            chrom = store.load_chromatogram(sha)
-            sample_name = str(chrom.metadata.get("sample_name") or path.stem)
-            ids.append(store.add_injection(sample_set_id, sample_name, sha))
+            info = dict(details[i]) if details else {}
+            if not info.get("sample_name"):
+                chrom = store.load_chromatogram(sha)
+                info["sample_name"] = str(chrom.metadata.get("sample_name") or path.stem)
+            ids.append(
+                store.add_injection(
+                    sample_set_id,
+                    info["sample_name"],
+                    sha,
+                    sample_type=info.get("sample_type", "unknown"),
+                    amounts=info.get("amounts"),
+                )
+            )
         self._refresh(("injection", ids[-1]) if ids else None)
         return ids
 
     @guarded
     def save_method(
-        self, project_id: int, name: str, params: IntegrationParams, reason: str = ""
+        self,
+        project_id: int,
+        name: str,
+        method: QuantMethod | IntegrationParams,
+        reason: str = "",
     ) -> int:
-        version_id = self._require_store().save_method_version(project_id, name, params, reason)
+        version_id = self._require_store().save_method_version(project_id, name, method, reason)
         self._load_methods(project_id, select=version_id)
         self.refresh_audit()
         return version_id
+
+    @guarded
+    def process_sample_set(
+        self, sample_set_id: int, method_version_id: int, reason: str = ""
+    ) -> SampleSetProcessing:
+        """Integrate, calibrate from the standards and quantitate a whole sample set."""
+        out = self._require_store().process_sample_set(sample_set_id, method_version_id, reason)
+        self.refresh_audit()
+        if self.injection_id is not None:
+            self._load_results()
+        self.refresh_calibration()
+        message = (
+            f"Processed {len(out.results)} injections; calibrated "
+            f"{', '.join(sorted(out.calibrations)) or 'no components'}"
+        )
+        if out.skipped:
+            message += "; not calibrated: " + "; ".join(
+                f"{name} ({why})" for name, why in sorted(out.skipped.items())
+            )
+        self.statusBar().showMessage(message)
+        return out
 
     @guarded
     def process_injection(self, injection_id: int, method_version_id: int, reason: str = "") -> int:
@@ -321,7 +371,26 @@ class MainWindow(QMainWindow):
             self._clear_view()
         else:
             self._load_injection(self.injection_id)
+        self.refresh_calibration()
         self._update_enabled()
+
+    def refresh_calibration(self, *_: object) -> None:
+        """Show the latest curves for the selected sample set and method version (the
+        selected result's method version if a result is shown, else the method box)."""
+        store = self.store
+        sample_set_id = self.tree.context().get("sample_set")
+        version_id = self.method_combo.currentData()
+        result_id = self.result_combo.currentData()
+        if store is not None and result_id is not None and self.injection_id is not None:
+            for result in store.results(self.injection_id):
+                if result.id == result_id:
+                    version_id = result.method_version_id
+        if store is None or sample_set_id is None or version_id is None:
+            self.calibration_view.set_calibrations([], {})
+            return
+        _, mv = store.method_version(version_id)
+        units = {c.name: c.unit for c in QuantMethod.from_dict(mv.params).components}
+        self.calibration_view.set_calibrations(store.calibrations(sample_set_id, version_id), units)
 
     @guarded
     def _load_injection(self, injection_id: int) -> None:
@@ -369,6 +438,7 @@ class MainWindow(QMainWindow):
         peaks = self.store.peaks(result_id) if self.store and result_id is not None else []
         self.plot.display(self.chromatogram, peaks)
         self.peak_table.set_peaks(peaks)
+        self.refresh_calibration()
 
     def refresh_audit(self) -> None:
         events = list(reversed(self.store.audit_trail())) if self.store else []
@@ -460,8 +530,33 @@ class MainWindow(QMainWindow):
         paths, _ = QFileDialog.getOpenFileNames(
             self, "Import AIA files", "", "AIA / ANDI (*.cdf *.CDF *.nc)"
         )
-        if paths:
-            self.import_files(sample_set_id, paths)
+        if not paths:
+            return
+        files = []
+        for path in map(Path, paths):
+            try:
+                name = str(read_aia(path).metadata.get("sample_name") or path.stem)
+            except (OSError, ValueError):
+                name = path.stem
+            files.append((path, name))
+        components: tuple[Component, ...] = ()
+        version_id = self.method_combo.currentData()
+        if self.store is not None and version_id is not None:
+            _, mv = self.store.method_version(version_id)
+            components = QuantMethod.from_dict(mv.params).components
+        dialog = dialogs.ImportDialog(self, files, components)
+        if dialog.exec():
+            details = self._dialog_value(dialog.details)
+            if details is not None:
+                self.import_files(sample_set_id, paths, details)
+
+    def _dialog_value[T](self, getter: Callable[[], T]) -> T | None:
+        """Read a dialog's result, showing validation errors instead of raising."""
+        try:
+            return getter()
+        except ValueError as exc:
+            QMessageBox.critical(self, "ChromaTix", str(exc))
+            return None
 
     def _edit_method_dialog(self) -> None:
         project_id = self.tree.context().get("project")
@@ -469,22 +564,25 @@ class MainWindow(QMainWindow):
         if self.store is None or project_id is None or version_id is None:
             return
         method, mv = self.store.method_version(version_id)
-        dialog = dialogs.MethodDialog(
-            self, method.name, QuantMethod.from_dict(mv.params).integration, False
-        )
+        dialog = dialogs.MethodDialog(self, method.name, QuantMethod.from_dict(mv.params), False)
         if not dialog.exec():
+            return
+        edited = self._dialog_value(dialog.method)
+        if edited is None:
             return
         reason = dialogs.ask_reason(self, "Change method", f"Reason for changing {method.name}:")
         if reason is not None:
-            self.save_method(project_id, method.name, dialog.params(), reason)
+            self.save_method(project_id, method.name, edited, reason)
 
     def _new_method_dialog(self) -> None:
         project_id = self.tree.context().get("project")
         if self.store is None or project_id is None:
             return
-        dialog = dialogs.MethodDialog(self, "", IntegrationParams(), True)
+        dialog = dialogs.MethodDialog(self, "", QuantMethod(), True)
         if dialog.exec() and dialog.name.text().strip():
-            self.save_method(project_id, dialog.name.text().strip(), dialog.params())
+            method = self._dialog_value(dialog.method)
+            if method is not None:
+                self.save_method(project_id, dialog.name.text().strip(), method)
 
     def _process_injection_action(self) -> None:
         version_id = self.method_combo.currentData()
@@ -512,10 +610,7 @@ class MainWindow(QMainWindow):
             if answer is None:
                 return
             reason = answer
-        for injection in injections:
-            needs_reason = bool(self.store.results(injection.id))
-            self.process_injection(injection.id, version_id, reason if needs_reason else "")
-        self.statusBar().showMessage(f"Processed {len(injections)} injections")
+        self.process_sample_set(sample_set_id, version_id, reason)
 
     # ----------------------------------------------------------------- helpers
     def _require_store(self) -> Store:
