@@ -107,13 +107,15 @@ class CalibrationPoint:
 
 
 def calibrate(component: Component, points: Sequence[CalibrationPoint]) -> CalibrationCurve:
-    """Fit ``component``'s calibration curve (response = area) from standard points."""
+    """Fit a component from standard areas and reject curves that turn within the range."""
     if not points:
         raise ValueError(f"{component.name}: no calibration points")
-    return fit_calibration(
+    curve = fit_calibration(
         [p.amount for p in points],
         [p.response for p in points],
         model=component.model,
         weighting=component.weighting,
         through_origin=component.through_origin,
     )
+    curve.validate_monotonic()
+    return curve

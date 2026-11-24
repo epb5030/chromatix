@@ -26,6 +26,14 @@ class CalibrationCurve:
     def response(self, amount: float) -> float:
         return float(np.polyval(self.coefficients, amount))
 
+    def validate_monotonic(self) -> None:
+        """Reject a quadratic with a turning point strictly inside the calibrated range."""
+        if self.model == "quadratic":
+            a, b, _ = self.coefficients
+            lo, hi = self.amount_range
+            if a != 0 and lo < (-0.5 * b) / a < hi:
+                raise ValueError("quadratic calibration turns within the calibrated amount range")
+
     def amount(self, response: float) -> float:
         """Back-calculate the amount that gives ``response``."""
         if self.model == "linear":
@@ -36,9 +44,8 @@ class CalibrationCurve:
         a, b, c = self.coefficients
         if a == 0:
             return (response - c) / b
+        self.validate_monotonic()
         lo, hi = self.amount_range
-        if lo < (-0.5 * b) / a < hi:
-            raise ValueError("quadratic calibration turns within the calibrated amount range")
         roots = np.roots([a, b, c - response])
         real = sorted(float(r.real) for r in roots if abs(r.imag) < 1e-12)
         if not real:

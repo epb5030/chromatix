@@ -187,3 +187,42 @@ def test_calibration_holds_sample_set_lock_through_writes(lab, backend, owner_en
             ).scalar_one()
             == ss
         )
+
+
+def test_turning_quadratic_is_skipped_while_monotonic_curve_is_saved(store, tmp_path):
+    project = store.create_project("Assay")
+    ss = store.create_sample_set(project, "SS")
+    method = ProcessingMethod(
+        components=tuple(Component(name, rt, model="quadratic") for name, rt in RT.items())
+    )
+    mv = store.save_method_version(project, "Quadratics", method)
+    for level in range(1, 6):
+        path = _write(
+            tmp_path / f"std{level}.cdf",
+            {"Caffeine": 2 + (level - 3) ** 2, "Theobromine": level + 0.3 * level**2},
+            seed=level,
+        )
+        store.add_injection(
+            ss,
+            f"Std {level}",
+            store.import_raw_file(path),
+            "standard",
+            amounts={name: level for name in RT},
+        )
+    path = _write(
+        tmp_path / "unknown.cdf",
+        {"Caffeine": 3.0, "Theobromine": 2.5 + 0.3 * 2.5**2},
+        seed=42,
+    )
+    unknown = store.add_injection(ss, "Unknown", store.import_raw_file(path))
+
+    out = store.process_sample_set(ss, mv)
+
+    assert set(out.skipped) == {"Caffeine"}
+    assert "turns within" in out.skipped["Caffeine"]
+    assert set(out.calibrations) == {"Theobromine"}
+    assert [cal.component for cal in store.calibrations(ss, mv)] == ["Theobromine"]
+    peaks = {peak.component: peak for peak in store.peaks(out.results[unknown])}
+    assert peaks["Caffeine"].amount is None
+    assert peaks["Caffeine"].calibration_id is None
+    assert peaks["Theobromine"].amount == pytest.approx(2.5, rel=0.03)
