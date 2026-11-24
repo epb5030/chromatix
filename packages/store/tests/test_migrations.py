@@ -23,12 +23,22 @@ def test_new_store_is_at_head(store, owner_engine):
     assert migrate.current_revision(owner_engine) == migrate.head_revision()
 
 
+def _store_at(engine, revision):
+    """Build a store at an older revision by running the migrations up to it."""
+    from alembic import command
+
+    with engine.begin() as conn:
+        command.upgrade(migrate._config(conn), revision)
+
+
 def _legacy_sqlite_store(path, *, baseline_layout=True):
-    """A store as ChromaTix created it before migrations existed (create_all, no version)."""
+    """A store as ChromaTix created it before migrations existed: the 0001 layout,
+    no alembic_version table."""
     engine = create_engine(f"sqlite:///{path.with_suffix('.sqlite')}")
     if baseline_layout:
-        Base.metadata.create_all(engine)
+        _store_at(engine, migrate.BASELINE)
         with engine.begin() as conn:
+            conn.execute(text("DROP TABLE alembic_version"))
             conn.execute(
                 text(
                     "INSERT INTO user_account (username, full_name, active, created_at) "
@@ -50,6 +60,37 @@ def test_unversioned_baseline_store_is_adopted(tmp_path):
     assert store.create_project("After upgrade") > 0
     backups = list(tmp_path.glob("lab.sqlite.bak-unversioned-*"))
     assert len(backups) == 1
+
+
+def test_upgrade_from_0001_keeps_data_and_protection(tmp_path):
+    """A 0001 store with a processed result upgrades to head; history is intact,
+    new columns are empty, and result_peak is still append-only (SQLite)."""
+    engine = create_engine(f"sqlite:///{(tmp_path / 'lab').with_suffix('.sqlite')}")
+    _store_at(engine, "0001")
+    with engine.begin() as conn:
+        for statement in (
+            "INSERT INTO user_account VALUES (1, 'u', '', 1, '2026-10-29')",
+            "INSERT INTO project VALUES (1, 'P', '', '2026-10-29', 1)",
+            "INSERT INTO sample_set VALUES (1, 1, 'SS', '2026-10-29', 1)",
+            "INSERT INTO raw_file VALUES ('" + "a" * 64 + "', 1, 'x.cdf', 'aia', '2026-10-29', 1)",
+            "INSERT INTO injection VALUES (1, 1, 1, 'Std', 'unknown', NULL, NULL, '"
+            + "a" * 64
+            + "', '2026-10-29', 1)",
+            "INSERT INTO processing_method VALUES (1, 1, 'Default')",
+            "INSERT INTO processing_method_version VALUES (1, 1, 1, '{}', '', '2026-10-29', 1)",
+            "INSERT INTO result VALUES (1, 1, 1, 1, '', '2026-10-29', 1)",
+            "INSERT INTO result_peak VALUES (1, 1, 1, 2.0, 1.9, 2.1, 100, 12.5, 0.1, 'BB', 2, 2)",
+        ):
+            conn.execute(text(statement))
+    engine.dispose()
+
+    store = Store.open_sqlite(tmp_path / "lab", "u")
+    assert migrate.current_revision(store.engine) == migrate.head_revision()
+    (peak,) = store.peaks(1)
+    assert (peak.area, peak.component, peak.amount, peak.calibration_id) == (12.5, None, None, None)
+    with pytest.raises(Exception, match="append-only"), store.engine.begin() as conn:
+        conn.execute(text("UPDATE result_peak SET area = 0"))
+    assert len(list(tmp_path.glob("lab.sqlite.bak-0001-*"))) == 1
 
 
 def test_old_layout_is_refused(tmp_path):

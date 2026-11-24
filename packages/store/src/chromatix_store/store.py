@@ -2,30 +2,44 @@
 
 from __future__ import annotations
 
-import dataclasses
 import hashlib
 import json
 import math
 import os
 import shutil
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
-from sqlalchemy import URL, Engine, Select, create_engine, event, func, make_url, select, text
+from sqlalchemy import (
+    URL,
+    Connection,
+    Engine,
+    Select,
+    create_engine,
+    event,
+    func,
+    make_url,
+    select,
+    text,
+)
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
-from chromatix_core import Chromatogram, IntegrationParams, integrate
+from chromatix_core import CalibrationCurve, Chromatogram, IntegrationParams, Peak, integrate
 from chromatix_core.io import read_aia
+from chromatix_core.quant import CalibrationPoint, Component, calibrate, identify
+from chromatix_core.quant import ProcessingMethod as QuantMethod
 from chromatix_store import migrate, pg_functions
 from chromatix_store.models import (
     APPEND_ONLY_TABLES,
     AuditEvent,
     Base,
+    Calibration,
     Injection,
     ProcessingMethod,
     ProcessingMethodVersion,
@@ -260,15 +274,13 @@ class Store:
     def _pg(self) -> bool:
         return self.engine.dialect.name == "postgresql"
 
-    def _call(self, sql: str, **params: Any) -> Any:
-        """Run one PostgreSQL write function in its own transaction.
-
-        The function enforces attribution and reason rules itself; its error
-        codes are turned back into the same exceptions the SQLite path raises.
-        """
+    @contextmanager
+    def _pg_tx(self) -> Iterator[Connection]:
+        """A PostgreSQL transaction whose write-function errors are mapped back to the
+        same exceptions the SQLite path raises (CXR01 reason, CXU01 unknown user)."""
         try:
             with self.engine.begin() as conn:
-                return conn.execute(text(sql), params).scalar()
+                yield conn
         except DBAPIError as exc:
             orig = exc.orig
             code = getattr(orig, "sqlstate", None)
@@ -279,6 +291,21 @@ class Store:
             if code == "CXU01":
                 raise PermissionError(message) from exc
             raise
+
+    def _call(self, sql: str, **params: Any) -> Any:
+        """Run one PostgreSQL write function in its own transaction."""
+        with self._pg_tx() as conn:
+            return conn.execute(text(sql), params).scalar()
+
+    @contextmanager
+    def _writer(self) -> Iterator[_Writer]:
+        """One transaction for several result/calibration writes, on either backend."""
+        if self._pg:
+            with self._pg_tx() as conn:
+                yield _PgWriter(conn)
+        else:
+            with self._tx() as (session, user):
+                yield _SqliteWriter(self, session, user)
 
     # ------------------------------------------------------------------ users
     @staticmethod
@@ -381,17 +408,22 @@ class Store:
         sample_type: str = "unknown",
         vial: str | None = None,
         amount: float | None = None,
+        amounts: Mapping[str, float] | None = None,
     ) -> int:
+        """Add an injection.  ``amounts`` are known component amounts (standards)."""
+        component_amounts = {k: float(v) for k, v in amounts.items()} if amounts else None
         if self._pg:
             return int(
                 self._call(
-                    "SELECT chromatix_add_injection(:ss, :name, :sha, :type, :vial, :amount)",
+                    "SELECT chromatix_add_injection(:ss, :name, :sha, :type, :vial, :amount, "
+                    "CAST(:amounts AS jsonb))",
                     ss=sample_set_id,
                     name=sample_name,
                     sha=raw_file_sha256,
                     type=sample_type,
                     vial=vial,
                     amount=amount,
+                    amounts=None if component_amounts is None else json.dumps(component_amounts),
                 )
             )
         with self._tx() as (s, user):
@@ -410,6 +442,7 @@ class Store:
                 sample_type=sample_type,
                 vial=vial,
                 amount=amount,
+                component_amounts=component_amounts,
                 raw_file_sha256=raw_file_sha256,
                 created_by=user.id,
             )
@@ -422,45 +455,57 @@ class Store:
                 inj.id,
                 sample_name=sample_name,
                 raw_file=raw_file_sha256,
+                sample_type=sample_type,
+                component_amounts=component_amounts,
             )
             return inj.id
 
     # ----------------------------------------------------- processing methods
     def save_method_version(
-        self, project_id: int, name: str, params: IntegrationParams, reason: str = ""
+        self,
+        project_id: int,
+        name: str,
+        method: QuantMethod | IntegrationParams,
+        reason: str = "",
     ) -> int:
-        """Save ``params`` as the next version of method ``name``; returns the version id."""
+        """Save ``method`` as the next version of method ``name``; returns the version id.
+
+        Plain :class:`IntegrationParams` are saved as a method without components.
+        """
+        if isinstance(method, IntegrationParams):
+            method = QuantMethod(integration=method)
+        params = method.to_dict()
         if self._pg:
             return int(
                 self._call(
                     "SELECT chromatix_save_method_version(:p, :n, CAST(:params AS jsonb), :r)",
                     p=project_id,
                     n=name,
-                    params=json.dumps(dataclasses.asdict(params)),
+                    params=json.dumps(params),
                     r=reason,
                 )
             )
         with self._tx() as (s, user):
-            method = s.scalar(
+            method_row = s.scalar(
                 select(ProcessingMethod).where(
                     ProcessingMethod.project_id == project_id, ProcessingMethod.name == name
                 )
             )
-            if method is None:
-                method = ProcessingMethod(project_id=project_id, name=name)
-                s.add(method)
+            if method_row is None:
+                method_row = ProcessingMethod(project_id=project_id, name=name)
+                s.add(method_row)
                 s.flush()
             latest = s.scalar(
                 select(func.max(ProcessingMethodVersion.version)).where(
-                    ProcessingMethodVersion.method_id == method.id
+                    ProcessingMethodVersion.method_id == method_row.id
                 )
             )
             if latest and not reason:
                 raise ReasonRequiredError("changing a processing method needs a reason")
             mv = ProcessingMethodVersion(
-                method_id=method.id,
+                method_id=method_row.id,
                 version=(latest or 0) + 1,
-                params=dataclasses.asdict(params),
+                params=params,
                 reason=reason,
                 created_by=user.id,
             )
@@ -479,88 +524,108 @@ class Store:
             return mv.id
 
     # ---------------------------------------------------------------- results
-    def process_injection(self, injection_id: int, method_version_id: int, reason: str = "") -> int:
-        """Integrate an injection with a method version; returns the new result id.
-
-        The first result needs no reason; any reprocessing does, and earlier
-        results are kept unchanged.
-        """
+    def _load_method(self, method_version_id: int) -> QuantMethod:
         with Session(self.engine) as s:
-            inj = s.get(Injection, injection_id)
             mv = s.get(ProcessingMethodVersion, method_version_id)
-            if inj is None or mv is None:
-                raise KeyError("unknown injection or method version")
-            sha, params = inj.raw_file_sha256, IntegrationParams(**mv.params)
-        peaks = integrate(self.load_chromatogram(sha), params)
+            if mv is None:
+                raise KeyError(f"unknown method version {method_version_id}")
+            return QuantMethod.from_dict(mv.params)
 
-        if self._pg:
-            rows = [
-                {
-                    "peak_number": number,
-                    "retention_time": pk.retention_time,
-                    "start_time": pk.start_time,
-                    "end_time": pk.end_time,
-                    "height": pk.height,
-                    "area": pk.area,
-                    "width_50": None if math.isnan(pk.width_50) else pk.width_50,
-                    "boundary": pk.boundary,
-                    "baseline_start": pk.baseline_start,
-                    "baseline_end": pk.baseline_end,
-                }
-                for number, pk in enumerate(peaks, start=1)
-            ]
-            return int(
-                self._call(
-                    "SELECT chromatix_save_result(:inj, :mv, :r, CAST(:peaks AS jsonb))",
-                    inj=injection_id,
-                    mv=method_version_id,
-                    r=reason,
-                    peaks=json.dumps(rows),
-                )
+    def process_injection(self, injection_id: int, method_version_id: int, reason: str = "") -> int:
+        """Integrate one injection and quantitate it; returns the new result id.
+
+        Identified peaks get amounts from the latest calibration of the same
+        sample set and method version, if there is one.  The first result needs
+        no reason; any reprocessing does, and earlier results are kept unchanged.
+        """
+        injection = self.injection(injection_id)
+        method = self._load_method(method_version_id)
+        peaks = integrate(self.load_chromatogram(injection.raw_file_sha256), method.integration)
+        curves = self.current_curves(injection.sample_set_id, method_version_id)
+        with self._writer() as writer:
+            return writer.save_result(
+                injection_id, method_version_id, reason, _peak_rows(peaks, method, curves)
             )
-        with self._tx() as (s, user):
-            latest = s.scalar(
-                select(func.max(Result.version)).where(Result.injection_id == injection_id)
-            )
-            if latest and not reason:
-                raise ReasonRequiredError("reprocessing an injection needs a reason")
-            result = Result(
-                injection_id=injection_id,
-                version=(latest or 0) + 1,
-                method_version_id=method_version_id,
-                reason=reason,
-                created_by=user.id,
-            )
-            s.add(result)
-            s.flush()
-            for number, pk in enumerate(peaks, start=1):
-                s.add(
-                    ResultPeak(
-                        result_id=result.id,
-                        peak_number=number,
-                        retention_time=pk.retention_time,
-                        start_time=pk.start_time,
-                        end_time=pk.end_time,
-                        height=pk.height,
-                        area=pk.area,
-                        width_50=None if math.isnan(pk.width_50) else pk.width_50,
-                        boundary=pk.boundary,
-                        baseline_start=pk.baseline_start,
-                        baseline_end=pk.baseline_end,
+
+    def process_sample_set(
+        self, sample_set_id: int, method_version_id: int, reason: str = ""
+    ) -> SampleSetProcessing:
+        """Integrate every injection, calibrate from the standards, quantitate everything.
+
+        Calibration points are the identified peak areas of injections whose
+        sample type is ``standard`` and that have a known amount for the
+        component.  Components that cannot be calibrated (e.g. too few
+        standards) are reported in ``skipped`` and get no amounts.  All curves
+        and results are written in a single transaction.  A reason is needed
+        if any injection already has a result.
+        """
+        method = self._load_method(method_version_id)
+        injections = self.injections(sample_set_id)
+        peaks = {
+            inj.id: integrate(self.load_chromatogram(inj.raw_file_sha256), method.integration)
+            for inj in injections
+        }
+        points: dict[str, list[CalibrationPoint]] = {c.name: [] for c in method.components}
+        for inj in injections:
+            if inj.sample_type != "standard" or not inj.component_amounts:
+                continue
+            for index, name in identify(peaks[inj.id], method.components).items():
+                amount = inj.component_amounts.get(name)
+                if amount is not None:
+                    points[name].append(
+                        CalibrationPoint(float(amount), peaks[inj.id][index].area, inj.id)
                     )
+        fitted: dict[str, tuple[CalibrationCurve, list[CalibrationPoint]]] = {}
+        skipped: dict[str, str] = {}
+        for component in method.components:
+            try:
+                fitted[component.name] = (
+                    calibrate(component, points[component.name]),
+                    points[component.name],
                 )
-            self._audit(
-                s,
-                "result.create",
-                "result",
-                result.id,
-                reason,
-                injection_id=injection_id,
-                version=result.version,
-                method_version_id=method_version_id,
-                peaks=len(peaks),
-            )
-            return result.id
+            except ValueError as exc:
+                skipped[component.name] = str(exc)
+        if not reason and any(self.results(inj.id) for inj in injections):
+            raise ReasonRequiredError("reprocessing a sample set needs a reason")
+
+        with self._writer() as writer:
+            curves = {
+                name: (
+                    writer.save_calibration(
+                        sample_set_id, method_version_id, method.component(name), curve, pts
+                    ),
+                    curve,
+                )
+                for name, (curve, pts) in fitted.items()
+            }
+            results = {
+                inj.id: writer.save_result(
+                    inj.id, method_version_id, reason, _peak_rows(peaks[inj.id], method, curves)
+                )
+                for inj in injections
+            }
+        return SampleSetProcessing(
+            results=results,
+            calibrations={name: cal_id for name, (cal_id, _) in curves.items()},
+            skipped=skipped,
+        )
+
+    def calibrations(
+        self, sample_set_id: int, method_version_id: int | None = None
+    ) -> list[Calibration]:
+        query = select(Calibration).where(Calibration.sample_set_id == sample_set_id)
+        if method_version_id is not None:
+            query = query.where(Calibration.method_version_id == method_version_id)
+        return self._all(query.order_by(Calibration.id))
+
+    def current_curves(
+        self, sample_set_id: int, method_version_id: int
+    ) -> dict[str, tuple[int, CalibrationCurve]]:
+        """Latest calibration per component for a sample set and method version."""
+        latest: dict[str, tuple[int, CalibrationCurve]] = {}
+        for cal in self.calibrations(sample_set_id, method_version_id):
+            latest[cal.component] = (cal.id, curve_of(cal))
+        return latest
 
     # ------------------------------------------------------------------ reads
     def _all(self, query: Select[Any]) -> list[Any]:
@@ -655,3 +720,215 @@ class Store:
         if entity_id is not None:
             query = query.where(AuditEvent.entity_id == str(entity_id))
         return self._all(query)
+
+
+# ---------------------------------------------------------------- quantitation
+@dataclass(frozen=True)
+class SampleSetProcessing:
+    results: dict[int, int]
+    """injection id -> new result id"""
+    calibrations: dict[str, int]
+    """component -> new calibration id"""
+    skipped: dict[str, str]
+    """component -> why it could not be calibrated"""
+
+
+def curve_of(cal: Calibration) -> CalibrationCurve:
+    """Rebuild the fitted curve stored in a calibration row."""
+    amounts = [float(p["amount"]) for p in cal.points] or [0.0]
+    return CalibrationCurve(
+        model=cal.model,  # type: ignore[arg-type]
+        coefficients=tuple(float(c) for c in cal.coefficients),
+        r_squared=math.nan if cal.r_squared is None else cal.r_squared,
+        weighting=cal.weighting,  # type: ignore[arg-type]
+        through_origin=cal.through_origin,
+        amount_range=(min(amounts), max(amounts)),
+    )
+
+
+def _peak_rows(
+    peaks: Sequence[Peak],
+    method: QuantMethod,
+    curves: Mapping[str, tuple[int, CalibrationCurve]],
+) -> list[dict[str, Any]]:
+    """Stored form of a result's peaks, with identification and amounts."""
+    names = identify(peaks, method.components)
+    rows = []
+    for index, pk in enumerate(peaks):
+        component = names.get(index)
+        amount: float | None = None
+        calibration_id: int | None = None
+        if component is not None and component in curves:
+            calibration_id, curve = curves[component]
+            try:
+                amount = curve.amount(pk.area)
+            except ValueError:
+                amount = None  # calibration cannot give an unambiguous amount
+        rows.append(
+            {
+                "peak_number": index + 1,
+                "retention_time": pk.retention_time,
+                "start_time": pk.start_time,
+                "end_time": pk.end_time,
+                "height": pk.height,
+                "area": pk.area,
+                "width_50": None if math.isnan(pk.width_50) else pk.width_50,
+                "boundary": pk.boundary,
+                "baseline_start": pk.baseline_start,
+                "baseline_end": pk.baseline_end,
+                "component": component,
+                "amount": amount,
+                "calibration_id": calibration_id,
+            }
+        )
+    return rows
+
+
+def _points_json(points: Sequence[CalibrationPoint]) -> list[dict[str, Any]]:
+    return [
+        {"injection_id": p.injection_id, "amount": p.amount, "response": p.response} for p in points
+    ]
+
+
+class _Writer(Protocol):
+    def save_result(
+        self, injection_id: int, method_version_id: int, reason: str, rows: list[dict[str, Any]]
+    ) -> int: ...
+
+    def save_calibration(
+        self,
+        sample_set_id: int,
+        method_version_id: int,
+        component: Component,
+        curve: CalibrationCurve,
+        points: Sequence[CalibrationPoint],
+    ) -> int: ...
+
+
+class _PgWriter:
+    """Writes through the SECURITY DEFINER functions, inside the caller's transaction."""
+
+    def __init__(self, conn: Connection) -> None:
+        self.conn = conn
+
+    def save_result(
+        self, injection_id: int, method_version_id: int, reason: str, rows: list[dict[str, Any]]
+    ) -> int:
+        return int(
+            self.conn.execute(
+                text("SELECT chromatix_save_result(:inj, :mv, :r, CAST(:peaks AS jsonb))"),
+                {
+                    "inj": injection_id,
+                    "mv": method_version_id,
+                    "r": reason,
+                    "peaks": json.dumps(rows),
+                },
+            ).scalar_one()
+        )
+
+    def save_calibration(
+        self,
+        sample_set_id: int,
+        method_version_id: int,
+        component: Component,
+        curve: CalibrationCurve,
+        points: Sequence[CalibrationPoint],
+    ) -> int:
+        return int(
+            self.conn.execute(
+                text(
+                    "SELECT chromatix_save_calibration(:ss, :mv, :c, :model, :w, :o, "
+                    "CAST(:coef AS jsonb), :r2, CAST(:pts AS jsonb))"
+                ),
+                {
+                    "ss": sample_set_id,
+                    "mv": method_version_id,
+                    "c": component.name,
+                    "model": curve.model,
+                    "w": curve.weighting,
+                    "o": curve.through_origin,
+                    "coef": json.dumps(list(curve.coefficients)),
+                    "r2": None if math.isnan(curve.r_squared) else curve.r_squared,
+                    "pts": json.dumps(_points_json(points)),
+                },
+            ).scalar_one()
+        )
+
+
+class _SqliteWriter:
+    """The same writes through the ORM, with the same audit events as the PG functions."""
+
+    def __init__(self, store: Store, session: Session, user: User) -> None:
+        self.store, self.session, self.user = store, session, user
+
+    def save_result(
+        self, injection_id: int, method_version_id: int, reason: str, rows: list[dict[str, Any]]
+    ) -> int:
+        s = self.session
+        latest = s.scalar(
+            select(func.max(Result.version)).where(Result.injection_id == injection_id)
+        )
+        if latest and not reason:
+            raise ReasonRequiredError("reprocessing an injection needs a reason")
+        result = Result(
+            injection_id=injection_id,
+            version=(latest or 0) + 1,
+            method_version_id=method_version_id,
+            reason=reason,
+            created_by=self.user.id,
+        )
+        s.add(result)
+        s.flush()
+        for row in rows:
+            s.add(ResultPeak(result_id=result.id, **row))
+        self.store._audit(
+            s,
+            "result.create",
+            "result",
+            result.id,
+            reason,
+            injection_id=injection_id,
+            version=result.version,
+            method_version_id=method_version_id,
+            peaks=len(rows),
+        )
+        return result.id
+
+    def save_calibration(
+        self,
+        sample_set_id: int,
+        method_version_id: int,
+        component: Component,
+        curve: CalibrationCurve,
+        points: Sequence[CalibrationPoint],
+    ) -> int:
+        s = self.session
+        r_squared = None if math.isnan(curve.r_squared) else curve.r_squared
+        cal = Calibration(
+            sample_set_id=sample_set_id,
+            method_version_id=method_version_id,
+            component=component.name,
+            model=curve.model,
+            weighting=curve.weighting,
+            through_origin=curve.through_origin,
+            coefficients=list(curve.coefficients),
+            r_squared=r_squared,
+            points=_points_json(points),
+            created_by=self.user.id,
+        )
+        s.add(cal)
+        s.flush()
+        self.store._audit(
+            s,
+            "calibration.create",
+            "calibration",
+            cal.id,
+            sample_set_id=sample_set_id,
+            method_version_id=method_version_id,
+            component=component.name,
+            model=curve.model,
+            coefficients=list(curve.coefficients),
+            r_squared=r_squared,
+            points=len(points),
+        )
+        return cal.id

@@ -41,3 +41,18 @@ def test_quadratic_back_calculation():
 def test_too_few_points():
     with pytest.raises(ValueError, match="at least"):
         fit_calibration([1, 2], [3, 4], model="linear")
+
+
+def test_repeated_amounts_require_a_full_rank_design():
+    with pytest.raises(ValueError, match="rank-deficient"):
+        fit_calibration([1, 1, 1], [2, 2, 2])
+    with pytest.raises(ValueError, match="rank-deficient"):
+        fit_calibration([0, 0], [0, 0], through_origin=True)
+    assert fit_calibration([1, 1], [2, 2], through_origin=True).amount(4) == pytest.approx(2)
+
+
+def test_quadratic_inverse_rejects_a_turn_inside_the_calibration_range():
+    x = np.arange(5, dtype=float)
+    curve = fit_calibration(x, (x - 2) ** 2, model="quadratic")
+    with pytest.raises(ValueError, match="turns within"):
+        curve.amount(1)  # both 1 and 3 produce this response

@@ -26,6 +26,14 @@ class CalibrationCurve:
     def response(self, amount: float) -> float:
         return float(np.polyval(self.coefficients, amount))
 
+    def validate_monotonic(self) -> None:
+        """Reject a quadratic with a turning point strictly inside the calibrated range."""
+        if self.model == "quadratic":
+            a, b, _ = self.coefficients
+            lo, hi = self.amount_range
+            if a != 0 and lo < (-0.5 * b) / a < hi:
+                raise ValueError("quadratic calibration turns within the calibrated amount range")
+
     def amount(self, response: float) -> float:
         """Back-calculate the amount that gives ``response``."""
         if self.model == "linear":
@@ -36,11 +44,12 @@ class CalibrationCurve:
         a, b, c = self.coefficients
         if a == 0:
             return (response - c) / b
+        self.validate_monotonic()
+        lo, hi = self.amount_range
         roots = np.roots([a, b, c - response])
         real = sorted(float(r.real) for r in roots if abs(r.imag) < 1e-12)
         if not real:
             raise ValueError(f"response {response} is outside the quadratic curve")
-        lo, hi = self.amount_range
         span = hi - lo
         inside = [r for r in real if lo - span <= r <= hi + span]
         candidates = inside or real
@@ -74,9 +83,15 @@ def fit_calibration(
 
     powers = list(range(degree, -1 if not through_origin else 0, -1))
     design = np.column_stack([x**k for k in powers])
-    w = {"none": np.ones_like(x), "1/x": 1 / x, "1/x^2": 1 / x**2}[weighting]
-    sw = np.sqrt(w)
-    solution, *_ = np.linalg.lstsq(design * sw[:, None], y * sw, rcond=None)
+    if weighting == "none":
+        sw = np.ones_like(x)
+    elif weighting == "1/x":
+        sw = np.sqrt(1 / x)
+    else:
+        sw = 1 / x
+    solution, _, rank, _ = np.linalg.lstsq(design * sw[:, None], y * sw, rcond=None)
+    if rank < n_params:
+        raise ValueError(f"{model} calibration fit is rank-deficient")
     coeffs = [float(c) for c in solution]
     if through_origin:
         coeffs.append(0.0)

@@ -12,21 +12,34 @@ with a tested processing engine and an audit-first data model.
   vendor-neutral export from Empower, Chromeleon and OpenLab). Detects and
   integrates peaks with baseline (`BB`) and drop-line (`BV`/`VB`/`VV`) splits, and
   fits linear or quadratic calibrations with optional 1/x or 1/x² weighting.
-  Accuracy is tested against synthetic chromatograms whose true areas are known
-  exactly (see `packages/core/tests/test_peaks_accuracy.py`).
+  Processing methods carry a **component table**: expected retention time,
+  window, calibration model, weighting and unit. Peaks are identified as the
+  closest match within each window. Accuracy is tested against synthetic
+  chromatograms whose true areas are known exactly (see
+  `packages/core/tests/test_peaks_accuracy.py`).
 - **`chromatix-store`**: Project → Sample Set → Injection; content-addressed,
   read-only raw files checked against their hash on every load; versioned
   processing methods and results; and an append-only audit trail enforced by
   database triggers. SQLite for one user, PostgreSQL for a shared lab.
+  - **Calibration and quantitation.** Injections record a sample type and, for
+    standards, known component amounts. Processing a sample set integrates
+    every injection, fits one curve per component from the standards, and
+    writes the curves and every quantitated result in one transaction.
+    Calibrations are append-only like results. A single injection processed
+    later uses the latest curves of its sample set.
 - **`chromatix-desktop`**: a native Qt app with no embedded browser engine.
   - Open a personal store (SQLite file) or connect to a shared one
     (PostgreSQL). The password is asked for and never saved.
   - Browse projects → sample sets → injections, and import AIA files into a
-    sample set.
-  - Edit processing methods; each saved change is a new version, and a
-    reason is required after the first.
-  - Process one injection or a whole sample set. Reprocessing asks for a reason
-    and keeps every earlier result version viewable.
+    sample set. The import table sets each file's sample name, sample type and
+    standard amounts.
+  - Edit processing methods: integration settings and components. Each saved
+    change is a new version, and a reason is required after the first.
+  - Process one injection or a whole sample set (calibrate and quantitate).
+    Reprocessing asks for a reason and keeps every earlier result version
+    viewable.
+  - Peak table with component and amount columns. The Calibration tab shows
+    each component's standard points, fitted curve, equation, R² and n.
   - Review the audit trail.
   - **Quick look** (File → Open file) integrates a single file without storing
     anything.

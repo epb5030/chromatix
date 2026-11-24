@@ -28,6 +28,7 @@ class Base(DeclarativeBase):
     # no time-zone type and returns them naive.
     type_annotation_map: ClassVar[dict[Any, Any]] = {
         dict[str, Any]: JSON().with_variant(JSONB(), "postgresql"),
+        list[Any]: JSON().with_variant(JSONB(), "postgresql"),
         datetime: DateTime(timezone=True),
     }
 
@@ -80,6 +81,8 @@ class Injection(Base):
     sample_type: Mapped[str] = mapped_column(String(32), default="unknown")
     vial: Mapped[str | None] = mapped_column(String(32))
     amount: Mapped[float | None]
+    # Known amounts for standards, per component name, e.g. {"Caffeine": 2.5}.
+    component_amounts: Mapped[dict[str, Any] | None]
     raw_file_sha256: Mapped[str] = mapped_column(ForeignKey("raw_file.sha256"))
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
     created_by: Mapped[int] = mapped_column(ForeignKey("user_account.id"))
@@ -138,6 +141,29 @@ class ResultPeak(Base):
     # exactly as it was integrated.
     baseline_start: Mapped[float]
     baseline_end: Mapped[float]
+    # Identification and quantitation (null when the peak matches no component).
+    component: Mapped[str | None] = mapped_column(String(200))
+    amount: Mapped[float | None]
+    calibration_id: Mapped[int | None] = mapped_column(ForeignKey("calibration.id"))
+
+
+class Calibration(Base):
+    """One component's calibration curve from one processing of a sample set."""
+
+    __tablename__ = "calibration"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    sample_set_id: Mapped[int] = mapped_column(ForeignKey("sample_set.id"))
+    method_version_id: Mapped[int] = mapped_column(ForeignKey("processing_method_version.id"))
+    component: Mapped[str] = mapped_column(String(200))
+    model: Mapped[str] = mapped_column(String(16))
+    weighting: Mapped[str] = mapped_column(String(8))
+    through_origin: Mapped[bool]
+    coefficients: Mapped[list[Any]]
+    r_squared: Mapped[float | None]
+    # [{"injection_id": 3, "amount": 1.0, "response": 1234.5}, ...]
+    points: Mapped[list[Any]]
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+    created_by: Mapped[int] = mapped_column(ForeignKey("user_account.id"))
 
 
 class AuditEvent(Base):
@@ -157,5 +183,6 @@ APPEND_ONLY_TABLES = (
     "processing_method_version",
     "result",
     "result_peak",
+    "calibration",
     "audit_event",
 )
