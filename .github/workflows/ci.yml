@@ -43,3 +43,19 @@ jobs:
           QT_QPA_PLATFORM: offscreen
           CHROMATIX_TEST_POSTGRES_URL: postgresql://chromatix:chromatix@localhost:5432/postgres
           CHROMATIX_REQUIRE_POSTGRES: "1"
+
+  # Windows is a supported platform (macOS is deferred). Lint, formatting and types are
+  # platform-independent and checked above; this job runs the test suite. GitHub only
+  # supports service containers on Linux runners, so PostgreSQL cases skip here and are
+  # covered by the Linux job.
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --all-packages --locked
+      - run: uv run pytest -q
+        env:
+          QT_QPA_PLATFORM: offscreen
