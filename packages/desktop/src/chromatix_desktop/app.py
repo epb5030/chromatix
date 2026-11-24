@@ -300,9 +300,9 @@ class MainWindow(QMainWindow):
         ids = []
         for i, path in enumerate(map(Path, paths)):
             sha = store.import_raw_file(path)
+            chrom = store.load_chromatogram(sha)
             info = dict(details[i]) if details else {}
             if not info.get("sample_name"):
-                chrom = store.load_chromatogram(sha)
                 info["sample_name"] = str(chrom.metadata.get("sample_name") or path.stem)
             ids.append(
                 store.add_injection(
@@ -546,17 +546,7 @@ class MainWindow(QMainWindow):
             components = QuantMethod.from_dict(mv.params).components
         dialog = dialogs.ImportDialog(self, files, components)
         if dialog.exec():
-            details = self._dialog_value(dialog.details)
-            if details is not None:
-                self.import_files(sample_set_id, paths, details)
-
-    def _dialog_value[T](self, getter: Callable[[], T]) -> T | None:
-        """Read a dialog's result, showing validation errors instead of raising."""
-        try:
-            return getter()
-        except ValueError as exc:
-            QMessageBox.critical(self, "ChromaTix", str(exc))
-            return None
+            self.import_files(sample_set_id, paths, dialog.details())
 
     def _edit_method_dialog(self) -> None:
         project_id = self.tree.context().get("project")
@@ -567,9 +557,7 @@ class MainWindow(QMainWindow):
         dialog = dialogs.MethodDialog(self, method.name, QuantMethod.from_dict(mv.params), False)
         if not dialog.exec():
             return
-        edited = self._dialog_value(dialog.method)
-        if edited is None:
-            return
+        edited = dialog.method()
         reason = dialogs.ask_reason(self, "Change method", f"Reason for changing {method.name}:")
         if reason is not None:
             self.save_method(project_id, method.name, edited, reason)
@@ -580,9 +568,7 @@ class MainWindow(QMainWindow):
             return
         dialog = dialogs.MethodDialog(self, "", QuantMethod(), True)
         if dialog.exec() and dialog.name.text().strip():
-            method = self._dialog_value(dialog.method)
-            if method is not None:
-                self.save_method(project_id, dialog.name.text().strip(), method)
+            self.save_method(project_id, dialog.name.text().strip(), dialog.method())
 
     def _process_injection_action(self) -> None:
         version_id = self.method_combo.currentData()

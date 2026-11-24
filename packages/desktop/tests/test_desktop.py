@@ -293,3 +293,40 @@ def test_import_dialog_details(parent, tmp_path):
     dialog.table.item(1, 4).setText("lots")
     with pytest.raises(ValueError, match="not a number"):
         dialog.details()
+
+
+def test_named_import_rejects_unreadable_data(window, tmp_path, errors):
+    window.open_personal_store(tmp_path / "lab", "tester")
+    project = window.create_project("Assay")
+    sample_set = window.create_sample_set(project, "SS")
+    invalid = tmp_path / "broken.cdf"
+    invalid.write_bytes(b"not a chromatogram")
+
+    assert window.import_files(sample_set, [invalid], [{"sample_name": "Named"}]) is None
+    assert errors
+    assert window.store.injections(sample_set) == []
+
+
+def test_dialogs_keep_edits_after_failed_acceptance(parent, errors, tmp_path):
+    method = dialogs.MethodDialog(parent, "Quant", QUANT, False)
+    method.add_component(Component("Caffeine", 3.0))
+    method.show()
+    method.accept()
+    assert "unique" in errors[-1]
+    assert method.isVisible()
+    assert method.components.item(2, 0).text() == "Caffeine"
+    method.components.item(2, 0).setText("Another")
+    method.accept()
+    assert method.result() == method.DialogCode.Accepted
+
+    dialog = dialogs.ImportDialog(parent, [(tmp_path / "a.cdf", "Std 1")], QUANT.components)
+    dialog.table.item(0, 3).setText("lots")
+    dialog.show()
+    dialog.accept()
+    assert "not a number" in errors[-1]
+    assert dialog.isVisible()
+    assert dialog.table.item(0, 3).text() == "lots"
+    dialog.table.item(0, 3).setText("1.5")
+    dialog.accept()
+    assert dialog.result() == dialog.DialogCode.Accepted
+    assert dialog.details()[0]["amounts"] == {"Caffeine": 1.5}

@@ -1,7 +1,7 @@
 """Calibration and quantitation through the store (SQLite and PostgreSQL)."""
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.exc import DBAPIError
 
 from chromatix_core import IntegrationParams
@@ -154,3 +154,36 @@ def test_injection_records_amounts_and_type(lab):
     assert injection.component_amounts == {"Caffeine": 2.0, "Theobromine": 1.0}
     event = store.audit_trail("injection", injection.id)[0]
     assert event.details["component_amounts"] == {"Caffeine": 2.0, "Theobromine": 1.0}
+
+
+def test_calibration_holds_sample_set_lock_through_writes(lab, backend, owner_engine):
+    if backend != "postgresql":
+        pytest.skip("PostgreSQL row lock")
+    store, ss, mv = lab["store"], lab["sample_set"], lab["method"]
+    locked_after = []
+
+    def check_lock(conn, cursor, statement, parameters, context, executemany):
+        if not statement.startswith("SELECT chromatix_save_calibration("):
+            return
+        with pytest.raises(DBAPIError) as raised, owner_engine.begin() as probe:
+            # Compatible with the weaker KEY SHARE lock taken by the foreign key.
+            probe.execute(
+                text("SELECT id FROM sample_set WHERE id = :id FOR NO KEY UPDATE NOWAIT"),
+                {"id": ss},
+            )
+        assert raised.value.orig.sqlstate == "55P03"
+        locked_after.append(statement)
+
+    event.listen(store.engine, "after_cursor_execute", check_lock)
+    try:
+        out = store.process_sample_set(ss, mv)
+    finally:
+        event.remove(store.engine, "after_cursor_execute", check_lock)
+    assert len(locked_after) == len(out.calibrations) == 2
+    with owner_engine.begin() as probe:
+        assert (
+            probe.execute(
+                text("SELECT id FROM sample_set WHERE id = :id FOR UPDATE NOWAIT"), {"id": ss}
+            ).scalar_one()
+            == ss
+        )

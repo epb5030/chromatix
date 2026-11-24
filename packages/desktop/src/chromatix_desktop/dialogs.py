@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import getpass
+import math
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,7 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -132,6 +134,14 @@ class MethodDialog(QDialog):
         buttons.rejected.connect(self.reject)
         outer.addWidget(buttons)
 
+    def accept(self) -> None:
+        try:
+            self.method()
+        except ValueError as exc:
+            QMessageBox.critical(self, "ChromaTix", str(exc))
+            return
+        super().accept()
+
     def add_component(self, component: Component) -> None:
         row = self.components.rowCount()
         self.components.insertRow(row)
@@ -239,6 +249,14 @@ class ImportDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+    def accept(self) -> None:
+        try:
+            self.details()
+        except ValueError as exc:
+            QMessageBox.critical(self, "ChromaTix", str(exc))
+            return
+        super().accept()
+
     def details(self) -> list[dict[str, Any]]:
         """One dict per file: sample_name, sample_type, amounts.  Raises ValueError on a
         non-numeric amount."""
@@ -253,11 +271,14 @@ class ImportDialog(QDialog):
                 text = item.text().strip() if item else ""
                 if text:
                     try:
-                        amounts[component.name] = float(text)
+                        amount = float(text)
                     except ValueError:
                         raise ValueError(
                             f"{path.name}: amount for {component.name} is not a number: {text!r}"
                         ) from None
+                    if not math.isfinite(amount):
+                        raise ValueError(f"{path.name}: amount for {component.name} must be finite")
+                    amounts[component.name] = amount
             out.append(
                 {
                     "sample_name": (name_item.text() if name_item else "").strip() or path.stem,

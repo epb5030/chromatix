@@ -763,7 +763,7 @@ def _peak_rows(
             try:
                 amount = curve.amount(pk.area)
             except ValueError:
-                amount = None  # response outside a quadratic curve
+                amount = None  # calibration cannot give an unambiguous amount
         rows.append(
             {
                 "peak_number": index + 1,
